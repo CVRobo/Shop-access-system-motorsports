@@ -2,3 +2,4 @@ slack_sdk==3.37.0
 pandas==2.3.3
 adafruit-circuitpython-pn532==1.6.0
 adafruit-circuitpython-ssd1306==5.5.1
+pillow==10.0.0
