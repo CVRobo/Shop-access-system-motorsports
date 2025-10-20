@@ -73,8 +73,9 @@ class ShopStatusManager:
 
     def approve_hours(self, member_name):
         df = pd.read_csv(self.attendance_csv)
-        # Find last entry for the member that is not approved yet
-        idx = df[(df["member_name"] == member_name) & (df["approved"] == False)].index.max()
+        # normalize to lowercase for comparison
+        mask = (df["member_name"].str.lower() == member_name.lower()) & (df["approved"] == False)
+        idx = df[mask].index.max()
         if pd.isna(idx):
             return False
         df.at[idx, "approved"] = True
