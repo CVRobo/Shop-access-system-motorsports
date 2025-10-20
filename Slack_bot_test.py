@@ -7,6 +7,8 @@ from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.errors import SlackApiError
 
+from shop_status_manager import ShopStatusManager  # import your manager class
+
 # -------------------------
 # Load environment variables
 # -------------------------
@@ -21,9 +23,9 @@ web_client = WebClient(token=SLACK_BOT_TOKEN)
 socket_client = SocketModeClient(app_token=SLACK_APP_TOKEN, web_client=web_client)
 
 # -------------------------
-# Mock data
+# Initialize shop manager
 # -------------------------
-logged_in = ["Kushagra", "Julianna"]
+manager = ShopStatusManager()
 
 # -------------------------
 # Message handler
@@ -38,13 +40,34 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
         if event.get("type") == "message" and "bot_id" not in event:
             text = event.get("text", "").lower()
             channel = event.get("channel")
+            user = event.get("user")
 
+            # -------------------------
             # Respond if user asked who's in the shop
+            # -------------------------
             if "who is in the shop" in text:
-                response = f"Current members in the shop:{', '.join(logged_in)}"
+                members = manager.get_current_members()  # fetch real-time members
+                members_list = ", ".join(members) if members else "Nobody"
+                response = f"Current members in the shop: {members_list}"
                 try:
                     web_client.chat_postMessage(channel=channel, text=response)
                     print(f"[BOT] Sent message: {response}")
+                except SlackApiError as e:
+                    print(f"Error posting message: {e.response['error']}")
+
+            # -------------------------
+            # Approve hours workflow
+            # -------------------------
+            if text.startswith("approve "):
+                member_name = text.replace("approve ", "").strip()
+                success = manager.approve_hours(member_name)
+                if success:
+                    reply = f"{member_name}'s hours approved ✅"
+                else:
+                    reply = f"No pending hours found for {member_name} ❌"
+                try:
+                    web_client.chat_postMessage(channel=channel, text=reply)
+                    print(f"[BOT] Sent message: {reply}")
                 except SlackApiError as e:
                     print(f"Error posting message: {e.response['error']}")
 
