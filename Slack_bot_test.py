@@ -58,20 +58,31 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
             # -------------------------
             # Approve hours workflow
             # -------------------------
-            if text.startswith("approve "):
-                member_name = text.replace("approve ", "").strip()
-                success = manager.approve_hours(member_name)
-                if success:
-                    reply = f"{member_name}'s hours approved ✅"
+            if text.lower().startswith("approve "):
+                parts = text.split()
+                member_name = parts[1]
+                approve_all_flag = len(parts) > 2 and parts[2].lower() == "all"
+
+                if approve_all_flag:
+                    total_hours = manager.approve_all_hours(member_name)
+                    if total_hours > 0:
+                        reply = f"All unapproved hours for {member_name} approved ✅ Total: {total_hours:.2f} hours"
+                    else:
+                        reply = f"No pending hours found for {member_name} ❌"
                 else:
-                    reply = f"No pending hours found for {member_name} ❌"
+                    success = manager.approve_hours(member_name)
+                    if success:
+                        reply = f"{member_name}'s last unapproved hours approved ✅"
+                    else:
+                        reply = f"No pending hours found for {member_name} ❌"
+
                 try:
                     web_client.chat_postMessage(channel=channel, text=reply)
                     print(f"[BOT] Sent message: {reply}")
                 except SlackApiError as e:
                     print(f"Error posting message: {e.response['error']}")
 
-# -------------------------
+                
 # Attach listener and start
 # -------------------------
 socket_client.socket_mode_request_listeners.append(process_message)

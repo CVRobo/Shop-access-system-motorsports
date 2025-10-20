@@ -81,6 +81,27 @@ class ShopStatusManager:
         df.at[idx, "approved"] = True
         df.to_csv(self.attendance_csv, index=False)
         return True
+    def approve_all_hours(self, member_name):
+        """
+        Approve all unapproved hours for the given member.
+        Returns total hours approved, or 0 if none found.
+        """
+        df = pd.read_csv(self.attendance_csv)
+        mask = (df["member_name"].str.lower() == member_name.lower()) & (df["approved"] == False)
+        to_approve = df[mask]
 
+        if to_approve.empty:
+            return 0.0
+
+        total_hours = to_approve["hours"].sum()
+        df.loc[mask, "approved"] = True
+        df.to_csv(self.attendance_csv, index=False)
+        return total_hours
     def get_current_members(self):
         return list(self.current_members.keys())
+    def is_lead_of(self, lead_slack_id, member_name):
+        member_row = self.members[self.members["member_name"].str.lower() == member_name.lower()]
+        if member_row.empty:
+            return False
+        lead_id = str(member_row.iloc[0]["lead_ID"]).strip()
+        return lead_id == lead_slack_id

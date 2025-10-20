@@ -13,5 +13,10 @@ time.sleep(2)  # wait some time
 
 # Simulate check-out
 manager.check_out("ABC1234567")
+time.sleep(2)  # wait some time
+manager.check_in("ABC1234567")  # Kushagra
+time.sleep(2)  # wait some time
+manager.check_out("ABC1234567")
+
 
 print("Current members after Kushagra checked out:", manager.get_current_members())
