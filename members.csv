@@ -1,4 +1,3 @@
-card_uid,name
-04A1B2C3D4,Alex
-0F11223344,Jamie
-ABC1234567,Kushagra
+card_uid, member_name, lead_name
+ABC1234567, Kushagra, Shorn
+DEF1234568, Julianna, Julianna
