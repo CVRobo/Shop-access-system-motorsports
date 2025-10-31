@@ -15,6 +15,7 @@ from slack_sdk.errors import SlackApiError
 load_dotenv()
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
+ANNOUNCE_CHANNEL_ID = "C09MS0MFKBK"  # ✅ use channel ID directly
 MEMBERS_FILE = "members.csv"
 ATTENDANCE_FILE = "attendance.csv"
 
@@ -41,7 +42,7 @@ def load_members():
 def get_open_session(card_uid):
     with open(ATTENDANCE_FILE, "r") as f:
         reader = csv.DictReader(f)
-        for row in reversed(list(reader)):  # iterate backwards
+        for row in reversed(list(reader)):
             if row["card_uid"] == card_uid and row["check_out"].strip() == "":
                 return row
     return None
@@ -57,7 +58,6 @@ def update_session_checkout(card_uid, checkout_time):
         reader = csv.DictReader(f)
         for row in reader:
             if row["card_uid"] == card_uid and row["check_out"].strip() == "":
-                # compute hours
                 t1 = datetime.fromisoformat(row["check_in"])
                 t2 = checkout_time
                 row["check_out"] = str(t2)
@@ -92,6 +92,13 @@ def current_checked_in():
                 checked_in.append(row["member_name"])
     return checked_in
 
+def post_to_channel(channel_id, text):
+    """Post message directly to a channel by ID."""
+    try:
+        web_client.chat_postMessage(channel=channel_id, text=text)
+    except SlackApiError as e:
+        print(f"Error posting to {channel_id}: {e.response['error']}")
+
 # --------------------------
 # Message handler
 # --------------------------
@@ -103,14 +110,25 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
     event = req.payload.get("event", {})
     if event.get("type") != "message" or "bot_id" in event:
         return
-    if event.get("channel_type") != "im":
-        return  # only DMs
 
-    slack_id = event["user"]
-    text = event["text"].strip().lower()
+    text = event.get("text", "").strip().lower()
+    slack_id = event.get("user")
+    channel_type = event.get("channel_type")
+
     members = load_members()
 
-    # Validate member
+    # 🟦 Public channel queries
+    if channel_type in ("channel", "group"):
+        if any(phrase in text for phrase in ["who is in shop", "who's in shop", "who is in the shop", "who's in the shop"]):
+            people = current_checked_in()
+            reply = "🏁 Currently in shop: " + ", ".join(people) if people else "🚪 The shop is currently empty."
+            web_client.chat_postMessage(channel=event["channel"], text=reply)
+        return
+
+    # 🟩 Direct messages only below
+    if channel_type != "im" or not slack_id:
+        return
+
     if slack_id not in members:
         web_client.chat_postMessage(channel=event["channel"], text="❌ You are not registered in members.csv.")
         return
@@ -121,9 +139,14 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
 
     # --- Commands ---
     if "check in" in text:
+        was_empty = len(current_checked_in()) == 0
         check_in_time = datetime.now()
         append_session(card_uid, name, str(check_in_time))
         web_client.chat_postMessage(channel=event["channel"], text=f"✅ {name}, you’ve been checked in at {check_in_time.strftime('%H:%M:%S')}.")
+
+        if was_empty:  # first person — announce shop open
+            people = current_checked_in()
+            post_to_channel(ANNOUNCE_CHANNEL_ID, f"🟢 Shop open! {name} just checked in.\nCurrently in shop: {', '.join(people)}")
 
     elif "check out" in text:
         open_session = get_open_session(card_uid)
@@ -134,16 +157,20 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
         update_session_checkout(card_uid, checkout_time)
         web_client.chat_postMessage(channel=event["channel"], text=f"👋 Checked you out at {checkout_time.strftime('%H:%M:%S')}.")
 
-        # Notify lead for approval
+        # Notify lead
         lead_id = member["lead_slack_id"]
         message = f"🧾 {name} checked out.\nHours worked: {round((checkout_time - datetime.fromisoformat(open_session['check_in'])).total_seconds() / 3600, 2)}\nApprove? Type `approve {name}`."
         web_client.chat_postMessage(channel=lead_id, text=message)
+
+        # Check if that was last person
+        if len(current_checked_in()) == 0:
+            post_to_channel(ANNOUNCE_CHANNEL_ID, f"🔴 Shop closed. Last person out: {name}")
 
     elif text.startswith("approve "):
         approver_id = slack_id
         target_name = text.replace("approve ", "").strip().title()
 
-        # Ensure approver is actually a lead for that member
+        # Ensure approver is lead
         lead_for = [m["member_name"] for m in members.values() if m["lead_slack_id"] == approver_id]
         if target_name not in lead_for:
             web_client.chat_postMessage(channel=event["channel"], text="🚫 You’re not the lead for that member.")
