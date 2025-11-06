@@ -230,7 +230,7 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
         if was_empty:
             people = current_checked_in()
             post_to_channel(ANNOUNCE_CHANNEL_ID,
-                            f"🟢 Shop open! {name} just checked in.\nCurrently in shop: {', '.join(people)}")
+                            f"Shop open! {name} just checked in.\nCurrently in shop: {', '.join(people)}")
         return
 
     # ---------- CHECK OUT ----------
@@ -262,7 +262,7 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
 
         # announce closed if last person
         if len(current_checked_in()) == 0:
-            post_to_channel(ANNOUNCE_CHANNEL_ID, f"🔴 Shop closed. Last person out: {name}")
+            post_to_channel(ANNOUNCE_CHANNEL_ID, f" Shop closed. Last person out: {name}")
         return
 
     # ---------- APPROVAL / DISAPPROVAL HANDLING ----------
@@ -371,9 +371,9 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
     if "who is in" in text_lc or "who's in" in text_lc:
         current = current_checked_in()
         if current:
-            reply = "🏁 Checked in:\n• " + "\n• ".join(current)
+            reply = " Checked in:\n• " + "\n• ".join(current)
         else:
-            reply = "😴 No one is currently checked in."
+            reply = " No one is currently checked in."
         web_client.chat_postMessage(channel=event["channel"], text=reply)
         return
 
