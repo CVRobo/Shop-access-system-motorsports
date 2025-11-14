@@ -1,6 +1,7 @@
 import os
 import csv
 import time
+import random
 from datetime import datetime
 from dotenv import load_dotenv
 from slack_sdk import WebClient
@@ -18,6 +19,56 @@ SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
 ANNOUNCE_CHANNEL_ID = "C09MS0MFKBK"  # channel ID to post open/close notices
 MEMBERS_FILE = "members.csv"
 ATTENDANCE_FILE = "attendance.csv"
+
+# Custom shop open messages — the bot will pick one at random when the shop opens.
+SHOP_OPEN_MESSAGES =[
+    "Shop portal detached from frame alignment (shop open) ",
+    "Workroom barrier rotated off-axis from jamb (facility accessible) ",
+    "Workshop door decoupled from its seal (shop active) ",
+    "Maker-space barrier angularly displaced from frame (open condition) ",
+    "Door–frame interface disengaged (workspace open) ",
+    "Access panel rotated beyond 0°–10° threshold (shop open) ",
+    "Entry barrier uncompressed from gasket (facility open) ",
+    "Primary door unengaged from strike plate (shop accessible) ",
+    "Ingress point mechanically liberated from frame (room open) ",
+    "Entrance panel no longer flush with threshold (open state achieved) ",
+
+    "Portal hinge system mobilized; access vector unobstructed (shop open) ",
+    "Entry mechanism actuated into the ‘unsealed’ configuration (space open) ",
+    "Door–frame cohesion reduced to negligible levels (shop accessible) ",
+    "Barrier rotation > 1 radian detected (workspace open) ",
+    "Ingress aperture expanded beyond secure bounds (shop open) ",
+    "Physical access impedance minimized (facility open) ",
+    "Portal integrity intentionally compromised (open mode active) ",
+    "Threshold obstruction set to null (workspace open) ",
+
+    "Door has divorced the frame — irreconcilable openness achieved ",
+    "The door and frame are ‘on a break’ (shop open) ",
+    "Portal is vibing away from the frame (shop open) ",
+    "Door reoriented into welcoming position (shop open) ",
+    "Barrier is expressing its extroverted phase (shop open) ",
+    "Door is in ‘open world’ mode (shop open) ",
+    "Entry panel socially distancing from frame (shop open) ",
+
+    "The gateway withdraws from its seal; the shop awakens ",
+    "The barrier relinquishes its duty; the workshop calls ",
+    "The entry rune de-binds; passage permitted ",
+    "The portal yields; creativity may enter ",
+
+    "Barrier unsealed (shop open) ",
+    "Portal unlocked (workspace active) ",
+    "Ingress enabled (shop open) ",
+    "Access granted (shop active) ",
+    "Portal disengaged (shop open) ",
+
+    "Workshop portal unbarred — operational state achieved ",
+    "Workshop ingress panel unsealed — entry permitted ",
+    "Lab barrier unlocked — space accessible ",
+    "Workspace door ajar — open mode engaged ",
+    "Shop portal unlatched — environment active ",
+    "Studio entry barrier de-secured — shop accessible ",
+]
+
 
 web_client = WebClient(token=SLACK_BOT_TOKEN)
 socket_client = SocketModeClient(app_token=SLACK_APP_TOKEN, web_client=web_client)
@@ -67,13 +118,20 @@ def load_members():
     return members
 
 def current_checked_in():
-    """Return list of member_name for sessions with empty check_out."""
+    """Return list of member_name for sessions with empty check_out (unique, file order)."""
     rows = read_attendance_rows()
     checked = []
     for r in rows:
         if r.get("check_out", "").strip() == "":
             checked.append(r.get("member_name"))
-    return checked
+    # preserve order but remove duplicates
+    seen = set()
+    unique = []
+    for name in checked:
+        if name not in seen:
+            seen.add(name)
+            unique.append(name)
+    return unique
 
 def append_session(card_uid, name, check_in_dt):
     """Add a new check-in row. check_in_dt is a datetime."""
@@ -221,16 +279,31 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
 
     # ---------- CHECK IN ----------
     if "check in" in text_lc:
+        # prevent multiple check-ins for same card_uid
+        existing = get_open_session(card_uid)
+        if existing:
+            # show when they checked in
+            try:
+                t = datetime.fromisoformat(existing["check_in"])
+                since = t.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                since = existing.get("check_in", "(unknown)")
+            web_client.chat_postMessage(channel=event["channel"],
+                                        text=f"⚠️ {name}, you are already checked in (since {since}). Please `check out` first.")
+            return
+
         was_empty = len(current_checked_in()) == 0
         check_in_time = datetime.now()
         append_session(card_uid, name, check_in_time)
         web_client.chat_postMessage(channel=event["channel"],
                                     text=f"✅ {name}, you’ve been checked in at {check_in_time.strftime('%H:%M:%S')}.")
+
         # announce open if first
         if was_empty:
             people = current_checked_in()
+            message = random.choice(SHOP_OPEN_MESSAGES)
             post_to_channel(ANNOUNCE_CHANNEL_ID,
-                            f"Shop open! {name} just checked in.\nCurrently in shop: {', '.join(people)}")
+                            f"{message}. {name} checked in.")
         return
 
     # ---------- CHECK OUT ----------
