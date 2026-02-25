@@ -1,0 +1,42 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pyinstaller slack_sdk python-dotenv
+
+      - name: Write .env from secrets
+        shell: bash
+        run: |
+          echo "SLACK_BOT_TOKEN=${{ secrets.SLACK_BOT_TOKEN }}" > .env
+          echo "SLACK_APP_TOKEN=${{ secrets.SLACK_APP_TOKEN }}" >> .env
+
+      - name: Build exe
+        run: >
+          pyinstaller --onefile
+          --add-data ".env;."
+          --hidden-import slack_sdk.socket_mode.builtin
+          --hidden-import slack_sdk.socket_mode.websocket_client
+          slack_test.py
+
+      - name: Upload exe as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-windows
+          path: dist/slack_test.exe
+          retention-days: 30

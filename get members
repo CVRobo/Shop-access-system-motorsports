@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 # -----------------------------
 load_dotenv()  # Load environment variables from .env
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-CHANNEL_ID = CHANNEL_ID = "C09ERK4PYMD"  # put your channel ID here or in .env
+CHANNEL_ID = CHANNEL_ID = "C09ERK4PYMD"  # channel ID, currently test channel
 
 client = WebClient(token=SLACK_BOT_TOKEN)
 

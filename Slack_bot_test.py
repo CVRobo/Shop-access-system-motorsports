@@ -45,7 +45,7 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
             # -------------------------
             # Respond if user asked who's in the shop
             # -------------------------
-            if "who is in the shop" in text:
+            if "who is in shop" in text:
                 members = manager.get_current_members()  # fetch real-time members
                 members_list = ", ".join(members) if members else "Nobody"
                 response = f"Current members in the shop: {members_list}"
