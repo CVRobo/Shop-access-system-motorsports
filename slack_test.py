@@ -20,8 +20,7 @@ ANNOUNCE_CHANNEL_ID = "C09MS0MFKBK"  # channel ID to post open/close notices
 MEMBERS_FILE = "members.csv"
 ATTENDANCE_FILE = "attendance.csv"
 
-# Custom shop open messages — the bot will pick one at random when the shop opens.
-SHOP_OPEN_MESSAGES =[
+SHOP_OPEN_MESSAGES = [
     "Shop portal detached from frame alignment (shop open) ",
     "Workroom barrier rotated off-axis from jamb (facility accessible) ",
     "Workshop door decoupled from its seal (shop active) ",
@@ -32,7 +31,6 @@ SHOP_OPEN_MESSAGES =[
     "Primary door unengaged from strike plate (shop accessible) ",
     "Ingress point mechanically liberated from frame (room open) ",
     "Entrance panel no longer flush with threshold (open state achieved) ",
-
     "Portal hinge system mobilized; access vector unobstructed (shop open) ",
     "Entry mechanism actuated into the ‘unsealed’ configuration (space open) ",
     "Door–frame cohesion reduced to negligible levels (shop accessible) ",
@@ -41,7 +39,6 @@ SHOP_OPEN_MESSAGES =[
     "Physical access impedance minimized (facility open) ",
     "Portal integrity intentionally compromised (open mode active) ",
     "Threshold obstruction set to null (workspace open) ",
-
     "Door has divorced the frame — irreconcilable openness achieved ",
     "The door and frame are ‘on a break’ (shop open) ",
     "Portal is vibing away from the frame (shop open) ",
@@ -49,18 +46,15 @@ SHOP_OPEN_MESSAGES =[
     "Barrier is expressing its extroverted phase (shop open) ",
     "Door is in ‘open world’ mode (shop open) ",
     "Entry panel socially distancing from frame (shop open) ",
-
     "The gateway withdraws from its seal; the shop awakens ",
     "The barrier relinquishes its duty; the workshop calls ",
     "The entry rune de-binds; passage permitted ",
     "The portal yields; creativity may enter ",
-
     "Barrier unsealed (shop open) ",
     "Portal unlocked (workspace active) ",
     "Ingress enabled (shop open) ",
     "Access granted (shop active) ",
     "Portal disengaged (shop open) ",
-
     "Workshop portal unbarred — operational state achieved ",
     "Workshop ingress panel unsealed — entry permitted ",
     "Lab barrier unlocked — space accessible ",
@@ -69,9 +63,14 @@ SHOP_OPEN_MESSAGES =[
     "Studio entry barrier de-secured — shop accessible ",
 ]
 
-
 web_client = WebClient(token=SLACK_BOT_TOKEN)
 socket_client = SocketModeClient(app_token=SLACK_APP_TOKEN, web_client=web_client)
+
+# --------------------------
+# Live in-memory occupancy
+# --------------------------
+# holds member_name strings (resets on bot restart; as requested)
+CURRENT_MEMBERS = set()
 
 # Ensure attendance file exists with headers
 if not os.path.exists(ATTENDANCE_FILE):
@@ -87,19 +86,19 @@ def read_attendance_rows():
     if not os.path.exists(ATTENDANCE_FILE):
         return []
     with open(ATTENDANCE_FILE, "r", newline="") as f:
-        reader = list(csv.DictReader(f))
-        return reader
+        return list(csv.DictReader(f))
 
 def write_attendance_rows(rows):
     """Overwrite attendance CSV with given rows (list of dicts)."""
     if not rows:
-        # write header only
         with open(ATTENDANCE_FILE, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["card_uid", "member_name", "check_in", "check_out", "hours", "approved"])
         return
+    # keep header ordering stable
+    fieldnames = ["card_uid", "member_name", "check_in", "check_out", "hours", "approved"]
     with open(ATTENDANCE_FILE, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -114,17 +113,17 @@ def load_members():
     with open(MEMBERS_FILE, "r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            # strip whitespace from fields
             members[row["slack_id"].strip()] = {k: v.strip() for k, v in row.items()}
     return members
 
 def current_checked_in():
-    """Return list of member_name for sessions with empty check_out (unique, file order)."""
+    """(legacy) Return list of member_name for sessions with empty check_out."""
     rows = read_attendance_rows()
     checked = []
     for r in rows:
         if r.get("check_out", "").strip() == "":
             checked.append(r.get("member_name"))
-    # preserve order but remove duplicates
     seen = set()
     unique = []
     for name in checked:
@@ -148,32 +147,61 @@ def get_open_session(card_uid):
             return r
     return None
 
-def update_session_checkout(card_uid, checkout_dt):
-    """Find most recent open session for card_uid and set checkout/hours/approved=False.
-    Returns the computed hours (float) or None if no open session found."""
+def find_open_session_index_by_name(member_name):
+    """Return the global index and row for the most recent open session by member_name, or (None, None)."""
     rows = read_attendance_rows()
-    updated = False
-    hours = None
-    # iterate reversed to find latest open
+    for i in range(len(rows)-1, -1, -1):
+        r = rows[i]
+        if r.get("member_name", "").strip().lower() == member_name.strip().lower() and r.get("check_out", "").strip() == "":
+            return i, r
+    return None, None
+
+def update_session_checkout_flexible(card_uid, member_name, checkout_dt):
+    """
+    Find most recent open session first by card_uid, then fallback to member_name.
+    Update check_out, hours, approved, write file.
+    Return (hours, original_check_in_iso) or (None, None) if none found.
+    """
+    rows = read_attendance_rows()
+    target_idx = None
+    # try by card_uid first
     for i in range(len(rows)-1, -1, -1):
         r = rows[i]
         if r.get("card_uid") == card_uid and r.get("check_out", "").strip() == "":
-            # parse check_in
-            try:
-                t1 = datetime.fromisoformat(r["check_in"])
-            except Exception:
-                # fallback parse
-                t1 = datetime.strptime(r["check_in"], "%Y-%m-%d %H:%M:%S.%f")
-            t2 = checkout_dt
-            r["check_out"] = t2.isoformat()
-            r["hours"] = round((t2 - t1).total_seconds() / 3600, 2)
-            r["approved"] = "False"
-            updated = True
-            hours = float(r["hours"])
+            target_idx = i
             break
-    if updated:
-        write_attendance_rows(rows)
-    return hours
+    # fallback by name
+    if target_idx is None:
+        for i in range(len(rows)-1, -1, -1):
+            r = rows[i]
+            if r.get("member_name", "").strip().lower() == member_name.strip().lower() and r.get("check_out", "").strip() == "":
+                target_idx = i
+                break
+    if target_idx is None:
+        return None, None
+
+    r = rows[target_idx]
+    # parse check_in safely
+    try:
+        t1 = datetime.fromisoformat(r["check_in"])
+    except Exception:
+        try:
+            t1 = datetime.strptime(r["check_in"], "%Y-%m-%d %H:%M:%S.%f")
+        except Exception:
+            # can't parse check_in — still set check_out but hours unknown
+            t1 = None
+
+    t2 = checkout_dt
+    r["check_out"] = t2.isoformat()
+    if t1:
+        r["hours"] = round((t2 - t1).total_seconds() / 3600, 2)
+        hours = float(r["hours"])
+    else:
+        r["hours"] = 0.0
+        hours = 0.0
+    r["approved"] = "False"
+    write_attendance_rows(rows)
+    return hours, r.get("check_in")
 
 def get_unapproved_sessions_with_indices(member_name):
     """Return list of tuples (global_index, row_dict) for unapproved sessions of member_name in file order."""
@@ -186,7 +214,6 @@ def get_unapproved_sessions_with_indices(member_name):
     return matches
 
 def approve_specific_session_by_global_index(global_index):
-    """Set approved=True for the row at global_index. Return True if success."""
     rows = read_attendance_rows()
     if global_index < 0 or global_index >= len(rows):
         return False
@@ -195,17 +222,14 @@ def approve_specific_session_by_global_index(global_index):
     return True
 
 def disapprove_specific_session_by_global_index(global_index):
-    """Remove the row at global_index from the file. Return True if removed."""
     rows = read_attendance_rows()
     if global_index < 0 or global_index >= len(rows):
         return False
-    # remove the targeted row
     rows.pop(global_index)
     write_attendance_rows(rows)
     return True
 
 def approve_all_unapproved(member_name):
-    """Mark all unapproved sessions for member_name as approved. Returns count approved."""
     rows = read_attendance_rows()
     count = 0
     for r in rows:
@@ -221,7 +245,6 @@ def approve_all_unapproved(member_name):
 # Slack posting helper
 # --------------------------
 def post_to_channel(channel_id, text):
-    """Post message directly to a channel by ID."""
     try:
         web_client.chat_postMessage(channel=channel_id, text=text)
     except SlackApiError as e:
@@ -233,11 +256,10 @@ def post_to_channel(channel_id, text):
 def process_message(client: SocketModeClient, req: SocketModeRequest):
     if req.type != "events_api":
         return
-    # ack
     client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
 
     event = req.payload.get("event", {})
-    if event.get("type") != "message" or "bot_id" in event:  # ignore bot messages
+    if event.get("type") != "message" or "bot_id" in event:
         return
 
     text = event.get("text", "").strip()
@@ -246,14 +268,11 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
     channel_type = event.get("channel_type")
     members = load_members()
 
-    # -----------------------
-    # Public channel listening
-    # -----------------------
+    # Public channels
     if channel_type in ("channel", "group"):
-        # lightweight phrase matching
         if any(phrase in text_lc for phrase in ["who is in shop", "who's in shop",
                                                 "who is in the shop", "who's in the shop"]):
-            people = current_checked_in()
+            people = list(CURRENT_MEMBERS)
             reply = "🏁 Currently in shop: " + ", ".join(people) if people else "🚪 The shop is currently empty."
             try:
                 web_client.chat_postMessage(channel=event["channel"], text=reply)
@@ -261,13 +280,10 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
                 print("Error posting public reply:", e.response["error"])
         return
 
-    # -----------------------
-    # Direct messages only below
-    # -----------------------
+    # DM only
     if channel_type != "im" or not slack_id:
         return
 
-    # Validate member exists
     if slack_id not in members:
         web_client.chat_postMessage(channel=event["channel"], text="❌ You are not registered in members.csv.")
         return
@@ -277,53 +293,81 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
     card_uid = member["card_uid"]
     lead_slack = member.get("lead_slack_id")
 
-    # ---------- CHECK IN ----------
+    # CHECK IN
     if "check in" in text_lc:
-        # prevent multiple check-ins for same card_uid
         existing = get_open_session(card_uid)
-        if existing:
-            # show when they checked in
-            try:
-                t = datetime.fromisoformat(existing["check_in"])
-                since = t.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                since = existing.get("check_in", "(unknown)")
-            web_client.chat_postMessage(channel=event["channel"],
-                                        text=f"⚠️ {name}, you are already checked in (since {since}). Please `check out` first.")
+        if existing or name in CURRENT_MEMBERS:
+            if existing:
+                try:
+                    t = datetime.fromisoformat(existing["check_in"])
+                    since = t.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    since = existing.get("check_in", "(unknown)")
+                web_client.chat_postMessage(channel=event["channel"],
+                                            text=f"⚠️ {name}, you are already checked in (since {since}). Please `check out` first.")
+            else:
+                web_client.chat_postMessage(channel=event["channel"],
+                                            text=f"⚠️ {name}, you are already checked in. Please `check out` first.")
             return
 
-        was_empty = len(current_checked_in()) == 0
+        # Determine if the shop was empty before this check-in (for announce)
+        was_empty_before = len(CURRENT_MEMBERS) == 0
+
         check_in_time = datetime.now()
-        append_session(card_uid, name, check_in_time)
+        # make append defensively; only add to CURRENT_MEMBERS if append succeeded
+        try:
+            append_session(card_uid, name, check_in_time)
+            CURRENT_MEMBERS.add(name)
+        except Exception as e:
+            print("Failed to append session:", e)
+            web_client.chat_postMessage(channel=event["channel"],
+                                        text="❌ Failed to record check-in (server error). Try again or contact admin.")
+            return
+
         web_client.chat_postMessage(channel=event["channel"],
                                     text=f"✅ {name}, you’ve been checked in at {check_in_time.strftime('%H:%M:%S')}.")
 
         # announce open if first
-        if was_empty:
-            people = current_checked_in()
+        if was_empty_before:
             message = random.choice(SHOP_OPEN_MESSAGES)
             post_to_channel(ANNOUNCE_CHANNEL_ID,
                             f"{message}. {name} checked in.")
         return
 
-    # ---------- CHECK OUT ----------
+    # CHECK OUT
     if "check out" in text_lc:
-        open_sess = get_open_session(card_uid)
-        if not open_sess:
-            web_client.chat_postMessage(channel=event["channel"], text="⚠️ You’re not currently checked in.")
-            return
+        # Try to update checkout, flexible fallback by name built-in
         checkout_time = datetime.now()
-        hours = update_session_checkout(card_uid, checkout_time)
+        hours, open_checkin_iso = update_session_checkout_flexible(card_uid, name, checkout_time)
+        if hours is None:
+            # nothing in CSV to close; maybe set mismatch — remove from CURRENT_MEMBERS defensively if present
+            if name in CURRENT_MEMBERS:
+                # we had them live-checked-in but CSV had no row; fix state and notify
+                CURRENT_MEMBERS.discard(name)
+                web_client.chat_postMessage(channel=event["channel"],
+                                            text="⚠️ Inconsistency detected: you were marked in-memory as checked in but no CSV session found. I've cleared your live state. Please check in again.")
+                return
+            else:
+                web_client.chat_postMessage(channel=event["channel"], text="⚠️ You’re not currently checked in.")
+                return
+
+        # remove from live set if present
+        CURRENT_MEMBERS.discard(name)
+
         web_client.chat_postMessage(channel=event["channel"],
                                     text=f"👋 Checked you out at {checkout_time.strftime('%H:%M:%S')}.")
+
         # Notify lead for approval (if lead available)
         if lead_slack:
-            # compute hours again to show precise amount (safest)
+            # compute hours again safely from returned check_in if available
             try:
-                t1 = datetime.fromisoformat(open_sess["check_in"])
+                if open_checkin_iso:
+                    t1 = datetime.fromisoformat(open_checkin_iso)
+                    hrs = round((checkout_time - t1).total_seconds() / 3600, 2)
+                else:
+                    hrs = round(hours, 2)
             except Exception:
-                t1 = datetime.strptime(open_sess["check_in"], "%Y-%m-%d %H:%M:%S.%f")
-            hrs = round((checkout_time - t1).total_seconds() / 3600, 2)
+                hrs = round(hours, 2)
             msg = (f"🧾 {name} checked out.\nHours worked: {hrs}\n"
                    f"To review pending sessions: `approve pending {name}`\n"
                    f"To approve a specific session: `approve {name} <number>`\n"
@@ -334,27 +378,20 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
                 print("Error DMing lead:", e.response["error"])
 
         # announce closed if last person
-        if len(current_checked_in()) == 0:
+        print(len(CURRENT_MEMBERS))
+        if len(CURRENT_MEMBERS) == 0:
             post_to_channel(ANNOUNCE_CHANNEL_ID, f" Shop closed. Last person out: {name}")
         return
 
-    # ---------- APPROVAL / DISAPPROVAL HANDLING ----------
-    # Commands supported:
-    #  - approve pending <Name>
-    #  - approve all <Name>
-    #  - approve <Name> <n>
-    #  - disapprove <Name> <n>
+    # APPROVAL / DISAPPROVAL HANDLING
     if text_lc.startswith("approve ") or text_lc.startswith("disapprove "):
         parts = text.split()
         cmd = parts[0].lower()
 
-        # handle 'approve pending <Name>'
         if len(parts) >= 3 and parts[1].lower() == "pending":
             target_name = " ".join(parts[2:]).strip()
-            # ensure approver is lead for that member
             approver_id = slack_id
             lead_for = [m["member_name"] for m in members.values() if m.get("lead_slack_id") == approver_id]
-            # permit if approver is lead for target
             if not any(t.strip().lower() == target_name.strip().lower() for t in lead_for):
                 web_client.chat_postMessage(channel=event["channel"],
                                             text="🚫 You’re not authorized to view pending sessions for that member.")
@@ -363,7 +400,6 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
             if not pending:
                 web_client.chat_postMessage(channel=event["channel"], text=f"✅ No pending sessions for {target_name}.")
                 return
-            # build listing
             msg_lines = [f"🕒 Pending sessions for *{target_name}*:"]
             for i, (gidx, row) in enumerate(pending, start=1):
                 ci = row.get("check_in", "")
@@ -375,7 +411,6 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
             web_client.chat_postMessage(channel=event["channel"], text="\n".join(msg_lines))
             return
 
-        # handle 'approve all <Name>'
         if cmd == "approve" and len(parts) >= 3 and parts[1].lower() == "all":
             target_name = " ".join(parts[2:]).strip()
             approver_id = slack_id
@@ -389,32 +424,24 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
                                         text=f"✅ Approved {count} unapproved session(s) for {target_name}.")
             return
 
-        # handle 'approve <Name> <n>' or 'disapprove <Name> <n>'
-        # fallback parsing: last token numeric is session number, rest is name
         if len(parts) >= 3 and parts[-1].isdigit():
             session_num = int(parts[-1])
             target_name = " ".join(parts[1:-1]).strip()
             if session_num <= 0:
                 web_client.chat_postMessage(channel=event["channel"], text="⚠️ Session number must be >= 1.")
                 return
-
-            # ensure approver is lead for that member
             approver_id = slack_id
             lead_for = [m["member_name"] for m in members.values() if m.get("lead_slack_id") == approver_id]
             if not any(t.strip().lower() == target_name.strip().lower() for t in lead_for):
                 web_client.chat_postMessage(channel=event["channel"],
                                             text="🚫 You’re not authorized to approve/disapprove for that member.")
                 return
-
             pending = get_unapproved_sessions_with_indices(target_name)
             if session_num > len(pending):
                 web_client.chat_postMessage(channel=event["channel"],
                                             text=f"⚠️ Invalid session number. There are {len(pending)} pending sessions for {target_name}.")
                 return
-
-            # map session number to global index
             global_index, row = pending[session_num - 1]
-
             if cmd == "approve":
                 ok = approve_specific_session_by_global_index(global_index)
                 if ok:
@@ -424,7 +451,6 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
                     web_client.chat_postMessage(channel=event["channel"],
                                                 text=f"⚠️ Failed to approve session #{session_num} for {target_name}.")
                 return
-
             if cmd == "disapprove":
                 ok = disapprove_specific_session_by_global_index(global_index)
                 if ok:
@@ -435,14 +461,13 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
                                                 text=f"⚠️ Failed to disapprove session #{session_num} for {target_name}.")
                 return
 
-        # if we fell through to here, unknown approve/disapprove usage
         web_client.chat_postMessage(channel=event["channel"],
                                     text="Usage:\n• `approve pending <Name>`\n• `approve <Name> <number>`\n• `approve all <Name>`\n• `disapprove <Name> <number>`")
         return
 
-    # ---------- WHO IS IN ----------
+    # WHO IS IN
     if "who is in" in text_lc or "who's in" in text_lc:
-        current = current_checked_in()
+        current = list(CURRENT_MEMBERS)
         if current:
             reply = " Checked in:\n• " + "\n• ".join(current)
         else:
@@ -450,7 +475,7 @@ def process_message(client: SocketModeClient, req: SocketModeRequest):
         web_client.chat_postMessage(channel=event["channel"], text=reply)
         return
 
-    # ---------- HELP / FALLBACK ----------
+    # HELP / FALLBACK
     web_client.chat_postMessage(channel=event["channel"],
                                 text="Try `check in`, `check out`, `who is in`, `approve pending <Name>`, `approve <Name> <n>`, `approve all <Name>`, or `disapprove <Name> <n>`.")
 
