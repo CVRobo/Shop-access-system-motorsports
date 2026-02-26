@@ -32,11 +32,11 @@ jobs:
           --add-data ".env;."
           --hidden-import slack_sdk.socket_mode.builtin
           --hidden-import slack_sdk.socket_mode.websocket_client
-          slack_test.py
+          slack_bot_main.py
 
       - name: Upload exe as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bot-windows
-          path: dist/slack_test.exe
+          name: slack-bot-windows
+          path: dist/slack_bot_main.exe
           retention-days: 30

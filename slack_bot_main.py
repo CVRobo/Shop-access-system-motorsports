@@ -1,4 +1,5 @@
 import os
+import sys
 import csv
 import time
 import random
@@ -10,10 +11,15 @@ from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.errors import SlackApiError
 
+from get_members import update_members_csv
+
 # --------------------------
 # Configuration
 # --------------------------
-load_dotenv()
+# When running as a PyInstaller bundle, data files live in sys._MEIPASS.
+# When running normally, they live next to this script.
+_BASE_DIR = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_BASE_DIR, ".env"))
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
@@ -286,7 +292,7 @@ def handle_approve_disapprove(event, slack_id, text, members):
     parts = text.split()
     cmd = parts[0].lower()
 
-    # approve pending <Name>
+    # approve pending <n>
     if len(parts) >= 3 and parts[1].lower() == "pending":
         target_name = " ".join(parts[2:])
         if not is_authorized_lead(slack_id, target_name, members):
@@ -299,11 +305,11 @@ def handle_approve_disapprove(event, slack_id, text, members):
         lines = [f"Pending sessions for {target_name}:"]
         for i, (_, row) in enumerate(pending, start=1):
             lines.append(f"{i}. check_in: {row['check_in']}  check_out: {row['check_out'] or '(open)'}  hours: {row['hours'] or '0.0'}")
-        lines += ["", "- `approve <Name> <number>` to approve", "- `disapprove <Name> <number>` to remove"]
+        lines += ["", "- `approve <n> <number>` to approve", "- `disapprove <n> <number>` to remove"]
         reply(event, "\n".join(lines))
         return
 
-    # approve all <Name>
+    # approve all <n>
     if cmd == "approve" and len(parts) >= 3 and parts[1].lower() == "all":
         target_name = " ".join(parts[2:])
         if not is_authorized_lead(slack_id, target_name, members):
@@ -313,7 +319,7 @@ def handle_approve_disapprove(event, slack_id, text, members):
         reply(event, f"Approved {count} session(s) for {target_name}.")
         return
 
-    # approve/disapprove <Name> <number>
+    # approve/disapprove <n> <number>
     if len(parts) >= 3 and parts[-1].isdigit():
         session_num = int(parts[-1])
         target_name = " ".join(parts[1:-1])
@@ -338,10 +344,10 @@ def handle_approve_disapprove(event, slack_id, text, members):
 
     reply(event, (
         "Usage:\n"
-        "- `approve pending <Name>`\n"
-        "- `approve <Name> <number>`\n"
-        "- `approve all <Name>`\n"
-        "- `disapprove <Name> <number>`"
+        "- `approve pending <n>`\n"
+        "- `approve <n> <number>`\n"
+        "- `approve all <n>`\n"
+        "- `disapprove <n> <number>`"
     ))
 
 
@@ -437,10 +443,10 @@ def process_message(client, req):
             "Available commands:\n"
             "- `check in` / `check out`\n"
             "- `who is in` / `is shop open`\n"
-            "- `approve pending <Name>`\n"
-            "- `approve <Name> <number>`\n"
-            "- `approve all <Name>`\n"
-            "- `disapprove <Name> <number>`\n"
+            "- `approve pending <n>`\n"
+            "- `approve <n> <number>`\n"
+            "- `approve all <n>`\n"
+            "- `disapprove <n> <number>`\n"
             "- `announcement formal` / `announcement casual` (admin only)"
         ))
 
@@ -448,6 +454,9 @@ def process_message(client, req):
 # --------------------------
 # Startup
 # --------------------------
+print("Syncing members list...")
+update_members_csv()
+
 ensure_attendance_file()
 
 socket_client.socket_mode_request_listeners.append(process_message)
