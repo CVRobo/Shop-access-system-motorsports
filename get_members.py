@@ -14,7 +14,9 @@ load_dotenv(os.path.join(_BASE_DIR, ".env"))
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 MEMBERS_CHANNEL_ID = "C09HVFVPCN9"
 MEMBERS_FILE = "members.csv"
-MEMBERS_HEADERS = ["card_uid", "member_name", "slack_id", "lead_slack_id"]
+MEMBERS_HEADERS = ["card_uid", "member_name", "slack_id", "seniority", "lead_slack_id"]
+
+DEFAULT_SENIORITY = 5  # most junior — safest default for new members
 
 client = WebClient(token=SLACK_BOT_TOKEN)
 
@@ -57,11 +59,10 @@ def get_user_details(user_id):
         return None
 
 # --------------------------
-# Load existing members.csv so we don't overwrite card_uid/lead_slack_id
-# that have been manually set
+# Load existing members.csv to preserve manual edits
 # --------------------------
 def load_existing_members():
-    """Return dict of slack_id -> existing row dict, so manual edits are preserved."""
+    """Return dict of slack_id -> existing row dict so manual edits are preserved."""
     existing = {}
     if not os.path.exists(MEMBERS_FILE):
         return existing
@@ -94,21 +95,22 @@ def update_members_csv():
         name = info["name"]
 
         if slack_id in existing:
-            # Preserve any manually set card_uid or lead_slack_id
             prev = existing[slack_id]
             rows.append({
-                "card_uid": prev.get("card_uid", "ABC123"),
-                "member_name": name,
-                "slack_id": slack_id,
-                "lead_slack_id": prev.get("lead_slack_id", slack_id),
+                "card_uid":     prev.get("card_uid", "ABC123"),
+                "member_name":  name,
+                "slack_id":     slack_id,
+                "seniority":    prev.get("seniority", DEFAULT_SENIORITY),
+                "lead_slack_id": prev.get("lead_slack_id", ""),
             })
         else:
-            # New member — use defaults
+            # New member — seniority defaults to 5, lead left blank for manual entry
             rows.append({
-                "card_uid": "ABC123",
-                "member_name": name,
-                "slack_id": slack_id,
-                "lead_slack_id": slack_id,
+                "card_uid":     "ABC123",
+                "member_name":  name,
+                "slack_id":     slack_id,
+                "seniority":    DEFAULT_SENIORITY,
+                "lead_slack_id": "",
             })
 
     with open(MEMBERS_FILE, "w", newline="") as f:

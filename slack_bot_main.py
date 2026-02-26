@@ -76,7 +76,7 @@ SHOP_OPEN_MESSAGES = [
 
 # Live in-memory state (resets on bot restart by design)
 CURRENT_MEMBERS = set()
-USE_FORMAL_MODE = False  # when True, shop-open announcements use FORMAL_OPEN_MESSAGE
+USE_FORMAL_MODE = False
 
 web_client = WebClient(token=SLACK_BOT_TOKEN)
 socket_client = SocketModeClient(app_token=SLACK_APP_TOKEN, web_client=web_client)
@@ -197,6 +197,97 @@ def load_members():
             for row in csv.DictReader(f)
         }
 
+def get_seniority(member):
+    """Return seniority as int. Lower = more senior. Defaults to 5 if missing/invalid."""
+    try:
+        return int(member.get("seniority", 5))
+    except (ValueError, TypeError):
+        return 5
+
+# --------------------------
+# Seniority-based notification helpers
+# --------------------------
+def find_most_senior_in_shop(members, exclude_name=None):
+    """
+    Return the slack_id of the most senior member currently in CURRENT_MEMBERS,
+    optionally excluding the person who just checked out.
+    Returns None if nobody else is present.
+    """
+    candidates = [
+        m for m in members.values()
+        if m["member_name"] in CURRENT_MEMBERS
+        and m["member_name"] != exclude_name
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=get_seniority)["slack_id"]
+
+
+def find_notify_target(check_in_iso, checkout_dt, checking_out_member, members):
+    """
+    Determine who to notify when someone checks out.
+
+    Priority order:
+      1. Most senior person currently in CURRENT_MEMBERS (handled by caller before this).
+      2. Most senior person who was co-present during this session (from attendance log).
+      3. The member's designated lead (fallback for solo sessions).
+      4. Admin (last resort if lead is also unset).
+
+    This function covers cases 2–4 (called only when shop is now empty).
+    """
+    exclude_name = checking_out_member["member_name"]
+    lead_id = checking_out_member.get("lead_slack_id", "").strip()
+
+    try:
+        session_start = datetime.fromisoformat(check_in_iso)
+    except (ValueError, TypeError):
+        # Can't parse check_in — fall straight to lead/admin
+        return lead_id or ADMIN_SLACK_ID
+
+    # Build name -> member lookup
+    name_to_member = {
+        m["member_name"].strip().lower(): m
+        for m in members.values()
+    }
+
+    co_present = []
+    for row in read_attendance_rows():
+        row_name = row.get("member_name", "").strip()
+        if row_name.lower() == exclude_name.strip().lower():
+            continue
+
+        try:
+            row_checkin = datetime.fromisoformat(row["check_in"])
+        except (ValueError, TypeError):
+            continue
+
+        row_checkout_str = row.get("check_out", "").strip()
+        if row_checkout_str:
+            try:
+                row_checkout = datetime.fromisoformat(row_checkout_str)
+            except (ValueError, TypeError):
+                continue
+            overlaps = row_checkin < checkout_dt and row_checkout > session_start
+        else:
+            # Still open — overlaps if it started before our checkout
+            overlaps = row_checkin < checkout_dt
+
+        if overlaps and row_name.lower() in name_to_member:
+            co_present.append(name_to_member[row_name.lower()])
+
+    if co_present:
+        # Case 2: someone was co-present — notify the most senior of them
+        return min(co_present, key=get_seniority)["slack_id"]
+
+    # Case 3: truly alone the whole session — fall back to their lead
+    if lead_id:
+        print(f"No co-present members found for {exclude_name}. Notifying lead {lead_id}.")
+        return lead_id
+
+    # Case 4: no lead set — fall back to admin
+    print(f"No lead set for {exclude_name}. Falling back to admin.")
+    return ADMIN_SLACK_ID
+
 # --------------------------
 # Slack helpers
 # --------------------------
@@ -209,12 +300,27 @@ def post(channel, text):
 def reply(event, text):
     post(event["channel"], text)
 
-def is_authorized_lead(approver_id, target_name, members):
-    return any(
-        m["member_name"].strip().lower() == target_name.strip().lower()
-        for m in members.values()
-        if m.get("lead_slack_id") == approver_id
+def is_authorized_approver(approver_id, target_name, members):
+    """
+    An approver is authorized if they are either:
+      - More senior (strictly lower seniority number) than the target, OR
+      - The target's designated lead
+    """
+    approver = members.get(approver_id)
+    if not approver:
+        return False
+
+    target = next(
+        (m for m in members.values() if m["member_name"].strip().lower() == target_name.strip().lower()),
+        None
     )
+    if not target:
+        return False
+
+    is_more_senior = get_seniority(approver) < get_seniority(target)
+    is_lead = target.get("lead_slack_id", "").strip() == approver_id
+
+    return is_more_senior or is_lead
 
 # --------------------------
 # Command handlers
@@ -257,6 +363,7 @@ def handle_check_out(event, member):
     name = member["member_name"]
     card_uid = member["card_uid"]
     checkout_time = datetime.now()
+    members = load_members()
 
     hours, check_in_iso = close_open_session(card_uid, name, checkout_time)
 
@@ -269,16 +376,26 @@ def handle_check_out(event, member):
             reply(event, "You're not currently checked in.")
         return
 
+    try:
+        hrs = round((checkout_time - datetime.fromisoformat(check_in_iso)).total_seconds() / 3600, 2) if check_in_iso else round(hours, 2)
+    except (ValueError, TypeError):
+        hrs = round(hours, 2)
+
+    # Remove from live set BEFORE checking who remains
     CURRENT_MEMBERS.discard(name)
+
     reply(event, f"Checked out at {checkout_time.strftime('%H:%M:%S')}.")
 
-    lead_slack = member.get("lead_slack_id")
-    if lead_slack:
-        try:
-            hrs = round((checkout_time - datetime.fromisoformat(check_in_iso)).total_seconds() / 3600, 2) if check_in_iso else round(hours, 2)
-        except (ValueError, TypeError):
-            hrs = round(hours, 2)
-        post(lead_slack,
+    # --- Determine who to notify ---
+    if CURRENT_MEMBERS:
+        # Others still present — notify the most senior of them
+        notify_id = find_most_senior_in_shop(members, exclude_name=name)
+    else:
+        # Last person out — use attendance log + lead fallback
+        notify_id = find_notify_target(check_in_iso, checkout_time, member, members)
+
+    if notify_id:
+        post(notify_id,
              f"{name} checked out. Hours worked: {hrs}\n"
              f"- `approve pending {name}` to view pending sessions\n"
              f"- `approve {name} <number>` to approve a specific session\n"
@@ -295,7 +412,7 @@ def handle_approve_disapprove(event, slack_id, text, members):
     # approve pending <n>
     if len(parts) >= 3 and parts[1].lower() == "pending":
         target_name = " ".join(parts[2:])
-        if not is_authorized_lead(slack_id, target_name, members):
+        if not is_authorized_approver(slack_id, target_name, members):
             reply(event, "You're not authorized to view pending sessions for that member.")
             return
         pending = get_unapproved_sessions(target_name)
@@ -312,7 +429,7 @@ def handle_approve_disapprove(event, slack_id, text, members):
     # approve all <n>
     if cmd == "approve" and len(parts) >= 3 and parts[1].lower() == "all":
         target_name = " ".join(parts[2:])
-        if not is_authorized_lead(slack_id, target_name, members):
+        if not is_authorized_approver(slack_id, target_name, members):
             reply(event, "You're not authorized to approve hours for that member.")
             return
         count = approve_all_sessions(target_name)
@@ -326,7 +443,7 @@ def handle_approve_disapprove(event, slack_id, text, members):
         if session_num <= 0:
             reply(event, "Session number must be 1 or greater.")
             return
-        if not is_authorized_lead(slack_id, target_name, members):
+        if not is_authorized_approver(slack_id, target_name, members):
             reply(event, "You're not authorized to approve/disapprove sessions for that member.")
             return
         pending = get_unapproved_sessions(target_name)
