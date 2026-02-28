@@ -99,12 +99,12 @@ SHOP_OPEN_MESSAGES = [
     "Ingress enabled (shop open)",
     "Access granted (shop active)",
     "Portal disengaged (shop open)",
-    "Workshop portal unbarred - operational state achieved (shop open)",
-    "Workshop ingress panel unsealed - entry permitted (shop open)",
-    "Lab barrier unlocked - space accessible (shop open)",
-    "Workspace door ajar - open mode engaged (shop open)",
-    "Shop portal unlatched - environment active (shop open)",
-    "Studio entry barrier de-secured - shop accessible (shop open)",
+    "Workshop portal unbarred - operational state achieved",
+    "Workshop ingress panel unsealed - entry permitted",
+    "Lab barrier unlocked - space accessible",
+    "Workspace door ajar - open mode engaged",
+    "Shop portal unlatched - environment active",
+    "Studio entry barrier de-secured - shop accessible",
 ]
 
 # Live in-memory state
@@ -812,6 +812,7 @@ def handle_admin_force_checkout(event, slack_id, parts, members):
     Lets authorized users manually close a stale open session without
     the member needing to DM the bot. Useful after a power cut.
     """
+    global SENIOR_PENDING
     approver = members.get(slack_id)
     is_seniority_1 = approver and get_seniority(approver) == 1
     is_admin = slack_id == ADMIN_SLACK_ID
@@ -824,23 +825,27 @@ def handle_admin_force_checkout(event, slack_id, parts, members):
         reply(event, "Usage: `admin force checkout <member name>`")
         return
 
-    target_name = " ".join(parts[3:])
+    target_name_input = " ".join(parts[3:])  # may be lowercase from text_lc
     checkout_time = datetime.now()
 
-    # Try to find an open session by name
+    # Find the open session — match case-insensitively but use the canonical
+    # name from the CSV row for all subsequent operations so CURRENT_MEMBERS
+    # (which stores properly-cased names) is updated correctly.
     rows = read_attendance_rows()
     target_idx = None
     for i in range(len(rows) - 1, -1, -1):
-        if rows[i]["member_name"].strip().lower() == target_name.strip().lower() \
+        if rows[i]["member_name"].strip().lower() == target_name_input.strip().lower() \
                 and not rows[i]["check_out"].strip():
             target_idx = i
             break
 
     if target_idx is None:
-        reply(event, f"No open session found for '{target_name}'.")
+        reply(event, f"No open session found for '{target_name_input}'.")
         return
 
     row = rows[target_idx]
+    target_name = row["member_name"].strip()  # canonical casing from CSV
+
     try:
         t1 = datetime.fromisoformat(row["check_in"])
         hrs = round((checkout_time - t1).total_seconds() / 3600, 2)
@@ -851,16 +856,17 @@ def handle_admin_force_checkout(event, slack_id, parts, members):
     row["hours"]     = hrs
     row["approved"]  = "False"
     write_attendance_rows(rows)
+
     CURRENT_MEMBERS.discard(target_name)
     SESSION_ALERTS.pop(target_name, None)
     if target_name in SENIOR_PENDING.values():
         SENIOR_PENDING = {k: v for k, v in SENIOR_PENDING.items() if v != target_name}
 
     logger.info(f"Admin force-closed session for {target_name} ({hrs}h)")
-    reply(event, f"✅ Force closed session for {target_name}. Hours recorded: {hrs}")
+    reply(event, f"Force closed session for {target_name}. Hours recorded: {hrs}")
 
     if len(CURRENT_MEMBERS) == 0:
-        post(ANNOUNCE_CHANNEL_ID, f"Shop closed. Last person out: {target_name} (admin force checkout)")
+        post(ANNOUNCE_CHANNEL_ID, f"Shop closed. Last person out: {target_name} (force checkout)")
 
 
 def handle_approve_disapprove(event, slack_id, text, members):
