@@ -99,12 +99,12 @@ SHOP_OPEN_MESSAGES = [
     "Ingress enabled (shop open)",
     "Access granted (shop active)",
     "Portal disengaged (shop open)",
-    "Workshop portal unbarred - operational state achieved",
-    "Workshop ingress panel unsealed - entry permitted",
-    "Lab barrier unlocked - space accessible",
-    "Workspace door ajar - open mode engaged",
-    "Shop portal unlatched - environment active",
-    "Studio entry barrier de-secured - shop accessible",
+    "Workshop portal unbarred - operational state achieved (shop open)",
+    "Workshop ingress panel unsealed - entry permitted (shop open)",
+    "Lab barrier unlocked - space accessible (shop open)",
+    "Workspace door ajar - open mode engaged (shop open)",
+    "Shop portal unlatched - environment active (shop open)",
+    "Studio entry barrier de-secured - shop accessible (shop open)",
 ]
 
 # Live in-memory state
