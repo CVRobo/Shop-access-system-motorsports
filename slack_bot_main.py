@@ -4,6 +4,7 @@ import csv
 import time
 import random
 import signal
+import threading
 import logging
 import tempfile
 from datetime import datetime, timedelta
@@ -51,6 +52,15 @@ SEMESTERS = {
 
 # Sessions open longer than this are considered stale (likely left open by a power cut)
 STALE_SESSION_HOURS = 12
+
+
+# --------------------------
+# Session watchdog configuration
+# --------------------------
+SESSION_CHECK_HOURS       = 3     # ping member after this many hours
+SESSION_RESPONSE_MINUTES  = 30    # minutes to wait for a reply before escalating
+SESSION_AUTO_CHECKOUT_HOURS = 8   # hard auto-checkout regardless of confirmations
+WATCHDOG_INTERVAL_SECONDS = 60    # how often the background thread runs
 
 FORMAL_OPEN_MESSAGE = "The shop is now open."
 
@@ -100,6 +110,19 @@ SHOP_OPEN_MESSAGES = [
 # Live in-memory state
 CURRENT_MEMBERS = set()
 USE_FORMAL_MODE  = False
+
+
+# Watchdog state — keyed by member_name
+# Each entry: {
+#   "stage":          "awaiting_member" | "awaiting_senior" | "confirmed_8h",
+#   "alert_sent_at":  datetime,
+#   "check_in_dt":    datetime,
+#   "senior_slack_id": str | None,   # slack_id of senior we escalated to
+# }
+SESSION_ALERTS = {}
+
+# Maps senior_slack_id -> member_name they are being asked to confirm
+SENIOR_PENDING = {}
 
 web_client    = WebClient(token=SLACK_BOT_TOKEN)
 socket_client = SocketModeClient(app_token=SLACK_APP_TOKEN, web_client=web_client)
@@ -443,6 +466,218 @@ def find_notify_target(check_in_iso, checkout_dt, checking_out_member, members):
     logger.warning(f"No lead set for {exclude_name} — falling back to admin")
     return ADMIN_SLACK_ID
 
+
+# --------------------------
+# Session watchdog
+# --------------------------
+def _auto_checkout_member(name, members):
+    """
+    Force-close an open session for `name`, update CURRENT_MEMBERS,
+    send notifications, and post to the announce channel if shop empties.
+    Called by the watchdog thread — safe to call from outside the main thread.
+    """
+    checkout_time = datetime.now()
+
+    # Find the member row so we can look up card_uid
+    member = next(
+        (m for m in members.values() if m["member_name"].strip() == name),
+        None
+    )
+    card_uid = member["card_uid"] if member else "ABC123"
+
+    hours, check_in_iso = close_open_session(card_uid, name, checkout_time)
+    CURRENT_MEMBERS.discard(name)
+    SESSION_ALERTS.pop(name, None)
+
+    logger.info(f"Watchdog auto-checked out {name} after no response ({hours}h)")
+
+    try:
+        hrs = round((checkout_time - datetime.fromisoformat(check_in_iso)).total_seconds() / 3600, 2)               if check_in_iso else round(hours or 0, 2)
+    except (ValueError, TypeError):
+        hrs = round(hours or 0, 2)
+
+    # Notify the member
+    if member:
+        post(member["slack_id"],
+             f"You have been automatically checked out after no response. "
+             f"Hours recorded: {hrs}. If this is incorrect, contact an admin.")
+
+    # Notify whoever should approve + announce if shop is now empty
+    if member and check_in_iso:
+        if CURRENT_MEMBERS:
+            notify_id = find_most_senior_in_shop(members, exclude_name=name)
+        else:
+            notify_id = find_notify_target(check_in_iso, checkout_time, member, members)
+
+        if notify_id:
+            post(notify_id,
+                 f"{name} was auto-checked out after no response to inactivity check. "
+                 f"Hours recorded: {hrs}\n"
+                 f"- `approve pending {name}` to review")
+
+    if len(CURRENT_MEMBERS) == 0:
+        post(ANNOUNCE_CHANNEL_ID, f"Shop closed. {name} was auto-checked out after inactivity.")
+
+
+def _send_member_alert(name, member_slack_id, elapsed_h):
+    """DM the member asking if they're still in the shop."""
+    post(member_slack_id,
+         f"You have been checked in for {elapsed_h:.1f} hours. Are you still in the shop?\n"
+         f"Reply *y* to confirm, or `check out` if you have left.")
+
+
+def _send_senior_alert(senior_slack_id, member_name, elapsed_h):
+    """DM the most senior other member in shop to confirm on behalf of an unresponsive member."""
+    post(senior_slack_id,
+         f"{member_name} has been in the shop for {elapsed_h:.1f} hours and has not responded "
+         f"to the inactivity check.\n"
+         f"Reply *y* if they are still present, or ignore this message to allow auto-checkout "
+         f"in {SESSION_RESPONSE_MINUTES} minutes.")
+
+
+def _watchdog_tick():
+    """
+    Called every WATCHDOG_INTERVAL_SECONDS. Checks every member currently
+    in CURRENT_MEMBERS against their open session start time and manages
+    the alert/escalation/auto-checkout lifecycle.
+    """
+    if not CURRENT_MEMBERS:
+        return
+
+    members = load_members()
+    now = datetime.now()
+
+    # Snapshot to avoid mutating CURRENT_MEMBERS while iterating
+    for name in list(CURRENT_MEMBERS):
+        # Find their open session
+        open_row = None
+        for row in reversed(read_attendance_rows()):
+            if row.get("member_name", "").strip() == name and not row.get("check_out", "").strip():
+                open_row = row
+                break
+
+        if not open_row:
+            continue
+
+        try:
+            check_in_dt = datetime.fromisoformat(open_row["check_in"])
+        except (ValueError, TypeError):
+            continue
+
+        elapsed_h = (now - check_in_dt).total_seconds() / 3600
+        alert = SESSION_ALERTS.get(name)
+        member = next(
+            (m for m in members.values() if m["member_name"].strip() == name),
+            None
+        )
+        if not member:
+            continue
+
+        # --- Hard auto-checkout at SESSION_AUTO_CHECKOUT_HOURS ---
+        if elapsed_h >= SESSION_AUTO_CHECKOUT_HOURS:
+            logger.info(f"Watchdog: {name} reached {SESSION_AUTO_CHECKOUT_HOURS}h hard limit — auto-checking out.")
+            # Clean up any pending senior confirmation
+            if alert and alert.get("senior_slack_id"):
+                SENIOR_PENDING.pop(alert["senior_slack_id"], None)
+            _auto_checkout_member(name, members)
+            continue
+
+        # --- Stage: no alert sent yet, crossed 3h threshold ---
+        if alert is None and elapsed_h >= SESSION_CHECK_HOURS:
+            logger.info(f"Watchdog: {name} has been in {elapsed_h:.1f}h — sending check-in ping.")
+            SESSION_ALERTS[name] = {
+                "stage":          "awaiting_member",
+                "alert_sent_at":  now,
+                "check_in_dt":    check_in_dt,
+                "senior_slack_id": None,
+            }
+            _send_member_alert(name, member["slack_id"], elapsed_h)
+            continue
+
+        if alert is None:
+            continue  # under threshold, nothing to do
+
+        alert_age_min = (now - alert["alert_sent_at"]).total_seconds() / 60
+
+        # --- Stage: awaiting member response, window expired ---
+        if alert["stage"] == "awaiting_member" and alert_age_min >= SESSION_RESPONSE_MINUTES:
+            # Try to find most senior OTHER member in shop
+            senior_slack_id = find_most_senior_in_shop(members, exclude_name=name)
+
+            if senior_slack_id:
+                logger.info(f"Watchdog: {name} did not respond — escalating to senior {senior_slack_id}.")
+                alert["stage"]          = "awaiting_senior"
+                alert["alert_sent_at"]  = now
+                alert["senior_slack_id"] = senior_slack_id
+                SENIOR_PENDING[senior_slack_id] = name
+                _send_senior_alert(senior_slack_id, name, elapsed_h)
+            else:
+                # Nobody else in shop — auto-checkout immediately
+                logger.info(f"Watchdog: {name} did not respond and is alone — auto-checking out.")
+                _auto_checkout_member(name, members)
+            continue
+
+        # --- Stage: awaiting senior response, window expired ---
+        if alert["stage"] == "awaiting_senior" and alert_age_min >= SESSION_RESPONSE_MINUTES:
+            logger.info(f"Watchdog: Senior did not respond for {name} — auto-checking out.")
+            if alert.get("senior_slack_id"):
+                SENIOR_PENDING.pop(alert["senior_slack_id"], None)
+            _auto_checkout_member(name, members)
+            continue
+
+        # --- Stage: confirmed at 3h, now watching for 8h ---
+        if alert["stage"] == "confirmed_8h" and elapsed_h >= SESSION_AUTO_CHECKOUT_HOURS - 0.5:
+            # Fire the 8h check (30 min before hard limit gives time to respond)
+            logger.info(f"Watchdog: {name} approaching 8h — sending final check-in ping.")
+            alert["stage"]         = "awaiting_member"
+            alert["alert_sent_at"] = now
+            _send_member_alert(name, member["slack_id"], elapsed_h)
+            continue
+
+
+def start_watchdog():
+    """Start the session watchdog as a daemon background thread."""
+    def loop():
+        logger.info("Session watchdog started.")
+        while True:
+            try:
+                _watchdog_tick()
+            except Exception as e:
+                logger.error(f"Watchdog error: {e}", exc_info=True)
+            time.sleep(WATCHDOG_INTERVAL_SECONDS)
+
+    t = threading.Thread(target=loop, daemon=True, name="SessionWatchdog")
+    t.start()
+    return t
+
+
+def confirm_session(name, confirmed_by_slack_id, members):
+    """
+    Called when a member or senior sends `y` to confirm someone is still in shop.
+    Returns True if the confirmation was valid and acted on, False if it was spurious.
+    """
+    alert = SESSION_ALERTS.get(name)
+    if not alert:
+        return False
+
+    # At 8h there's no grace — auto-checkout is always the outcome, don't accept confirmations
+    elapsed_h = (datetime.now() - alert["check_in_dt"]).total_seconds() / 3600
+    if elapsed_h >= SESSION_AUTO_CHECKOUT_HOURS:
+        return False
+
+    # Clear any senior pending entry
+    if alert.get("senior_slack_id"):
+        SENIOR_PENDING.pop(alert["senior_slack_id"], None)
+
+    logger.info(f"Session confirmed for {name} by {confirmed_by_slack_id}.")
+    SESSION_ALERTS[name] = {
+        "stage":           "confirmed_8h",
+        "alert_sent_at":   datetime.now(),
+        "check_in_dt":     alert["check_in_dt"],
+        "senior_slack_id": None,
+    }
+    return True
+
 # --------------------------
 # Slack posting helpers
 # --------------------------
@@ -512,6 +747,7 @@ def handle_check_in(event, member):
     try:
         append_session(card_uid, name, check_in_time)
         CURRENT_MEMBERS.add(name)
+        SESSION_ALERTS.pop(name, None)  # ensure no stale watchdog state
         logger.info(f"{name} checked in at {check_in_time.isoformat()}")
     except Exception as e:
         logger.error(f"Failed to append session for {name}: {e}")
@@ -550,6 +786,7 @@ def handle_check_out(event, member):
         hrs = round(hours, 2)
 
     CURRENT_MEMBERS.discard(name)
+    SESSION_ALERTS.pop(name, None)  # clear any pending watchdog alert
     reply(event, f"Checked out at {checkout_time.strftime('%H:%M:%S')}.")
 
     if CURRENT_MEMBERS:
@@ -615,6 +852,9 @@ def handle_admin_force_checkout(event, slack_id, parts, members):
     row["approved"]  = "False"
     write_attendance_rows(rows)
     CURRENT_MEMBERS.discard(target_name)
+    SESSION_ALERTS.pop(target_name, None)
+    if target_name in SENIOR_PENDING.values():
+        SENIOR_PENDING = {k: v for k, v in SENIOR_PENDING.items() if v != target_name}
 
     logger.info(f"Admin force-closed session for {target_name} ({hrs}h)")
     reply(event, f"✅ Force closed session for {target_name}. Hours recorded: {hrs}")
@@ -1013,6 +1253,34 @@ def process_message(client, req):
 
     logger.info(f"Command from {member['member_name']} ({slack_id}): {text!r}")
 
+    # Watchdog confirmation — member or senior replying "y"
+    if text_lc in ("y",):
+        name = member["member_name"]
+        # Check if this person is themselves awaiting confirmation
+        if name in SESSION_ALERTS and SESSION_ALERTS[name]["stage"] in ("awaiting_member",):
+            ok = confirm_session(name, slack_id, members)
+            if ok:
+                reply(event, "Got it — session extended. We'll check in again closer to 8 hours.")
+            return
+        # Check if this person is a senior being asked to confirm someone else
+        if slack_id in SENIOR_PENDING:
+            target_name = SENIOR_PENDING[slack_id]
+            ok = confirm_session(target_name, slack_id, members)
+            if ok:
+                reply(event, f"Confirmed — {target_name}'s session has been extended.")
+                # Also notify the member their session was confirmed by someone else
+                target_member = next(
+                    (m for m in members.values() if m["member_name"].strip() == target_name),
+                    None
+                )
+                if target_member:
+                    post(target_member["slack_id"],
+                         f"Your session was confirmed by a senior member. "
+                         f"You will be checked out automatically at 8 hours if you don't respond to the next check.")
+            return
+        # Spurious y — ignore silently
+        return
+
     if "check in" in text_lc:
         handle_check_in(event, member)
     elif "check out" in text_lc:
@@ -1084,6 +1352,9 @@ if recovered:
     logger.info(f"Shop currently has {len(recovered)} active member(s): {', '.join(sorted(recovered))}")
 else:
     logger.info("Shop is empty at startup.")
+
+logger.info("Starting session watchdog...")
+start_watchdog()
 
 # Register signal handlers for graceful shutdown
 signal.signal(signal.SIGTERM, handle_shutdown)
