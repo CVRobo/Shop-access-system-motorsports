@@ -2,6 +2,8 @@ import os
 import sys
 import csv
 import time
+import logging
+import tempfile
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
@@ -16,8 +18,9 @@ MEMBERS_CHANNEL_ID = "C09HVFVPCN9"
 MEMBERS_FILE = "members.csv"
 MEMBERS_HEADERS = ["card_uid", "member_name", "slack_id", "seniority", "lead_slack_id"]
 
-DEFAULT_SENIORITY = 5  # most junior — safest default for new members
+DEFAULT_SENIORITY = 5  # 1 = most senior, 5 = most junior
 
+logger = logging.getLogger(__name__)
 client = WebClient(token=SLACK_BOT_TOKEN)
 
 # --------------------------
@@ -36,10 +39,10 @@ def get_channel_members(channel_id):
         except SlackApiError as e:
             if e.response["error"] == "ratelimited":
                 retry_after = int(e.response.headers.get("Retry-After", 20))
-                print(f"Rate limited. Retrying in {retry_after} seconds...")
+                logger.warning(f"Rate limited fetching members. Retrying in {retry_after}s...")
                 time.sleep(retry_after)
             else:
-                print(f"Error fetching members: {e.response['error']}")
+                logger.error(f"Error fetching channel members: {e.response['error']}")
                 break
     return members
 
@@ -55,8 +58,31 @@ def get_user_details(user_id):
                 }
         return None
     except SlackApiError as e:
-        print(f"Failed to fetch user {user_id}: {e.response['error']}")
+        logger.error(f"Failed to fetch user {user_id}: {e.response['error']}")
         return None
+
+# --------------------------
+# Atomic CSV write
+# --------------------------
+def _atomic_write_csv(filepath, headers, rows):
+    """
+    Write rows to a temp file in the same directory, then atomically
+    replace the target file. Prevents corruption on power loss mid-write.
+    """
+    dirpath = os.path.dirname(os.path.abspath(filepath))
+    fd, tmp_path = tempfile.mkstemp(dir=dirpath, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(tmp_path, filepath)  # atomic on all supported OSes
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 # --------------------------
 # Load existing members.csv to preserve manual edits
@@ -76,12 +102,12 @@ def load_existing_members():
 # --------------------------
 def update_members_csv():
     if not SLACK_BOT_TOKEN:
-        print("Missing SLACK_BOT_TOKEN — skipping member sync.")
+        logger.warning("Missing SLACK_BOT_TOKEN — skipping member sync.")
         return
 
-    print(f"Syncing members from channel {MEMBERS_CHANNEL_ID}...")
+    logger.info(f"Syncing members from channel {MEMBERS_CHANNEL_ID}...")
     member_ids = get_channel_members(MEMBERS_CHANNEL_ID)
-    print(f"Found {len(member_ids)} member IDs. Fetching details...")
+    logger.info(f"Found {len(member_ids)} member IDs. Fetching details...")
 
     existing = load_existing_members()
     rows = []
@@ -97,31 +123,28 @@ def update_members_csv():
         if slack_id in existing:
             prev = existing[slack_id]
             rows.append({
-                "card_uid":     prev.get("card_uid", "ABC123"),
-                "member_name":  name,
-                "slack_id":     slack_id,
-                "seniority":    prev.get("seniority", DEFAULT_SENIORITY),
+                "card_uid":      prev.get("card_uid", "ABC123"),
+                "member_name":   name,
+                "slack_id":      slack_id,
+                "seniority":     prev.get("seniority", DEFAULT_SENIORITY),
                 "lead_slack_id": prev.get("lead_slack_id", ""),
             })
         else:
-            # New member — seniority defaults to 5, lead left blank for manual entry
+            logger.info(f"New member detected: {name} ({slack_id})")
             rows.append({
-                "card_uid":     "ABC123",
-                "member_name":  name,
-                "slack_id":     slack_id,
-                "seniority":    DEFAULT_SENIORITY,
+                "card_uid":      "ABC123",
+                "member_name":   name,
+                "slack_id":      slack_id,
+                "seniority":     DEFAULT_SENIORITY,
                 "lead_slack_id": "",
             })
 
-    with open(MEMBERS_FILE, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=MEMBERS_HEADERS)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"members.csv updated with {len(rows)} members.")
+    _atomic_write_csv(MEMBERS_FILE, MEMBERS_HEADERS, rows)
+    logger.info(f"members.csv updated with {len(rows)} members.")
 
 # --------------------------
 # Allow running standalone
 # --------------------------
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     update_members_csv()

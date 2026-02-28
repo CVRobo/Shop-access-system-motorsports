@@ -2,3 +2,4 @@ __pycache__
 .env
 attendance.csv
 .DS_Store
+bot.log
