@@ -31,6 +31,24 @@ MEMBERS_FILE        = "members.csv"
 ATTENDANCE_FILE   = "attendance.csv"
 ATTENDANCE_HEADERS = ["card_uid", "member_name", "check_in", "check_out", "hours", "approved"]
 
+
+# --------------------------
+# Semester configuration (Stony Brook University academic calendar)
+# Adjust the month/day boundaries here if dates shift year to year.
+# Winter crosses the calendar year boundary — handled automatically.
+# --------------------------
+SEMESTERS = {
+    "Winter": {
+        "ranges": [
+            (12, 21, 12, 31),  # Dec 21 – Dec 31  (current year)
+            (1,   1,  1, 26),  # Jan  1 – Jan 26  (next year, same winter)
+        ]
+    },
+    "Spring": {"ranges": [(1, 27, 5, 31)]},   # Jan 27 – May 31
+    "Summer": {"ranges": [(6,  1, 8, 14)]},   # Jun  1 – Aug 14
+    "Fall":   {"ranges": [(8, 15, 12, 20)]},  # Aug 15 – Dec 20
+}
+
 # Sessions open longer than this are considered stale (likely left open by a power cut)
 STALE_SESSION_HOURS = 12
 
@@ -227,13 +245,17 @@ def approve_session(global_index):
     return True
 
 def delete_session(global_index):
+    """
+    Mark a session as Disapproved rather than removing it.
+    This keeps the record visible in `hours report` while hiding it from `my hours`.
+    """
     rows = read_attendance_rows()
     if not (0 <= global_index < len(rows)):
         return False
     name = rows[global_index].get("member_name", "?")
-    rows.pop(global_index)
+    rows[global_index]["approved"] = "Disapproved"
     write_attendance_rows(rows)
-    logger.info(f"Session deleted for {name} at index {global_index}")
+    logger.info(f"Session disapproved for {name} at index {global_index}")
     return True
 
 def approve_all_sessions(member_name):
@@ -697,6 +719,258 @@ def handle_who_is_in(event):
         reply(event, "No one is currently checked in.")
 
 
+
+# --------------------------
+# Hours report helpers
+# --------------------------
+def get_academic_year_bounds():
+    """
+    Academic year runs Sep 1 – Aug 31.
+    Returns (start_dt, end_dt) for the current academic year.
+    """
+    today = datetime.now()
+    if today.month >= 9:
+        start = datetime(today.year, 9, 1)
+        end   = datetime(today.year + 1, 8, 31, 23, 59, 59)
+    else:
+        start = datetime(today.year - 1, 9, 1)
+        end   = datetime(today.year, 8, 31, 23, 59, 59)
+    return start, end
+
+def get_sessions_this_year(member_name, include_disapproved=False):
+    """
+    Return all sessions for member_name within the current academic year.
+    Disapproved sessions (approved == "False" with a completed check_out AND
+    explicitly deleted are already gone from the CSV — but sessions that were
+    force-closed and never touched still show as False.
+
+    For `my hours`: exclude disapproved. A session is considered disapproved
+    only if it was explicitly marked by setting approved = "Disapproved".
+    We write "False" for pending and "True" for approved, so "Disapproved"
+    is a third state we'll use going forward.
+
+    For `hours report`: include everything.
+    """
+    start, end = get_academic_year_bounds()
+    rows = read_attendance_rows()
+    results = []
+
+    for row in rows:
+        if row["member_name"].strip().lower() != member_name.strip().lower():
+            continue
+
+        try:
+            check_in_dt = datetime.fromisoformat(row["check_in"])
+        except (ValueError, TypeError):
+            continue
+
+        if not (start <= check_in_dt <= end):
+            continue
+
+        approved_val = str(row.get("approved", "")).strip().lower()
+        is_disapproved = approved_val == "disapproved"
+
+        if not include_disapproved and is_disapproved:
+            continue
+
+        results.append(row)
+
+    return results
+
+# --------------------------
+# Semester helpers
+# --------------------------
+def get_current_semester():
+    """
+    Return (semester_name, start_date, end_date) for today's date.
+    Winter spans the Dec/Jan year boundary so it is handled specially.
+    Returns (None, None, None) if today falls in a gap between semesters.
+    """
+    today = datetime.now().date()
+    year  = today.year
+
+    # Build candidate ranges for this year, checking both year and year-1
+    # so winter sessions started in Dec of last year are still caught.
+    for sem_name, cfg in SEMESTERS.items():
+        for rng in cfg["ranges"]:
+            sm, sd, em, ed = rng
+            start = datetime(year, sm, sd).date()
+            end   = datetime(year, em, ed).date()
+
+            # Winter Dec portion may belong to the *previous* year's winter
+            if sem_name == "Winter" and sm == 12:
+                # Also check: did this range start last year?
+                prev_start = datetime(year - 1, sm, sd).date()
+                prev_end   = datetime(year,     em, ed).date() if em < sm else datetime(year - 1, em, ed).date()
+                # The Dec portion of last year's winter
+                dec_start = datetime(year - 1, 12, 21).date()
+                dec_end   = datetime(year - 1, 12, 31).date()
+                jan_start = datetime(year, 1, 1).date()
+                jan_end   = datetime(year, 1, 26).date()
+                if dec_start <= today <= dec_end or jan_start <= today <= jan_end:
+                    return "Winter", dec_start, jan_end
+
+            if start <= today <= end:
+                return sem_name, start, end
+
+    return None, None, None
+
+
+def format_hours_report(sessions, include_disapproved=False):
+    """
+    Format a list of session rows into a readable report string.
+    - For members (`include_disapproved=False`): hides disapproved sessions.
+    - For seniors/leads (`include_disapproved=True`): shows all sessions with
+      a [DISAPPROVED] tag so they can see the full picture.
+    Returns (formatted_string, total_approved_hours, total_pending_hours).
+    """
+    lines = []
+    total_approved = 0.0
+    total_pending  = 0.0
+
+    for i, row in enumerate(sessions, start=1):
+        approved = str(row.get("approved", "")).strip().lower()
+
+        if approved == "false" or approved == "":
+            status = "⏳ Pending"
+            try:
+                total_pending += float(row.get("hours", 0))
+            except (ValueError, TypeError):
+                pass
+        elif approved == "true":
+            status = "✅ Approved"
+            try:
+                total_approved += float(row.get("hours", 0))
+            except (ValueError, TypeError):
+                pass
+        else:
+            # "disapproved" / deleted row still in file edge case
+            if not include_disapproved:
+                continue
+            status = "❌ Disapproved"
+
+        try:
+            ci = datetime.fromisoformat(row["check_in"]).strftime("%b %d  %H:%M")
+        except (ValueError, TypeError):
+            ci = row.get("check_in", "?")
+
+        try:
+            co = datetime.fromisoformat(row["check_out"]).strftime("%H:%M") if row.get("check_out", "").strip() else "(open)"
+        except (ValueError, TypeError):
+            co = row.get("check_out", "?")
+
+        try:
+            hrs = f"{float(row.get('hours', 0)):.2f}h"
+        except (ValueError, TypeError):
+            hrs = "?h"
+
+        lines.append(f"{i}. {ci} – {co}  |  {hrs}  |  {status}")
+
+    return "\n".join(lines), round(total_approved, 2), round(total_pending, 2)
+
+
+def get_semester_sessions(member_name, start_date, end_date, include_disapproved=False):
+    """
+    Return attendance rows for member_name whose check_in falls within
+    [start_date, end_date]. Filters out disapproved rows unless include_disapproved.
+    """
+    rows = read_attendance_rows()
+    results = []
+    for row in rows:
+        if row.get("member_name", "").strip().lower() != member_name.strip().lower():
+            continue
+
+        approved = str(row.get("approved", "")).strip().lower()
+        if not include_disapproved and approved not in ("true", "false", ""):
+            continue  # skip disapproved
+
+        try:
+            ci_date = datetime.fromisoformat(row["check_in"]).date()
+        except (ValueError, TypeError):
+            continue
+
+        if start_date <= ci_date <= end_date:
+            results.append(row)
+
+    return results
+
+
+# --------------------------
+# Hours report handlers
+# --------------------------
+def handle_my_hours(event, member):
+    """
+    `my hours`
+    Shows the member their own sessions for the current semester.
+    Disapproved sessions are hidden. Pending sessions show approval status.
+    """
+    name = member["member_name"]
+    sem_name, start, end = get_current_semester()
+
+    if sem_name is None:
+        reply(event, "Could not determine the current semester. Contact an admin.")
+        return
+
+    sessions = get_semester_sessions(name, start, end, include_disapproved=False)
+
+    if not sessions:
+        reply(event, f"No sessions recorded for you this {sem_name} semester ({start} – {end}).")
+        return
+
+    body, approved_hrs, pending_hrs = format_hours_report(sessions, include_disapproved=False)
+
+    reply(event, (
+        f"Your hours \u2014 {sem_name} {start.year} ({start} \u2013 {end}):\n\n"
+        f"{body}\n\n"
+        f"Approved: {approved_hrs}h  |  Pending approval: {pending_hrs}h"
+    ))
+
+
+def handle_hours_report(event, slack_id, text_lc, members):
+    """
+    `hours report <member name>`
+    Available to anyone more senior than the target, or their designated lead.
+    Shows all sessions including disapproved ones, with full status breakdown.
+    """
+    target_name = text_lc.removeprefix("hours report ").strip()
+    if not target_name:
+        reply(event, "Usage: `hours report <member name>`")
+        return
+
+    if not is_authorized_approver(slack_id, target_name, members):
+        reply(event, "You're not authorized to view hours for that member.")
+        return
+
+    target = next(
+        (m for m in members.values() if m["member_name"].strip().lower() == target_name.lower()),
+        None
+    )
+    if not target:
+        reply(event, f"Member '{target_name}' not found.")
+        return
+
+    display_name = target["member_name"]
+    sem_name, start, end = get_current_semester()
+
+    if sem_name is None:
+        reply(event, "Could not determine the current semester. Contact an admin.")
+        return
+
+    sessions = get_semester_sessions(display_name, start, end, include_disapproved=True)
+
+    if not sessions:
+        reply(event, f"No sessions found for {display_name} this {sem_name} semester ({start} – {end}).")
+        return
+
+    body, approved_hrs, pending_hrs = format_hours_report(sessions, include_disapproved=True)
+
+    reply(event, (
+        f"Hours report for {display_name} — {sem_name} {start.year} ({start} – {end}):\n\n"
+        f"{body}\n\n"
+        f"Approved: {approved_hrs}h  |  Pending: {pending_hrs}h"
+    ))
+
+
 # --------------------------
 # Main event dispatcher
 # --------------------------
@@ -756,6 +1030,10 @@ def process_message(client, req):
         handle_announcement_casual(event, slack_id)
     elif "is shop open" in text_lc or "is the shop open" in text_lc:
         handle_is_shop_open(event["channel"])
+    elif text_lc == "my hours":
+        handle_my_hours(event, member)
+    elif text_lc.startswith("hours report "):
+        handle_hours_report(event, slack_id, text_lc, members)
     elif "who is in" in text_lc or "who's in" in text_lc:
         handle_who_is_in(event)
     else:
@@ -763,12 +1041,14 @@ def process_message(client, req):
             "Available commands:\n"
             "- `check in` / `check out`\n"
             "- `who is in` / `is shop open`\n"
+            "- `my hours`\n"
+            "- `hours report <name>` (seniors/leads only)\n"
             "- `approve pending <name>`\n"
             "- `approve <name> <number>`\n"
             "- `approve all <name>`\n"
             "- `disapprove <name> <number>`\n"
             "- `announcement formal` / `announcement casual` (admin only)\n"
-            "- `admin force checkout <name>` (admin only)"
+            "- `admin force checkout <name>` (seniority-1 / admin only)"
         ))
 
 
