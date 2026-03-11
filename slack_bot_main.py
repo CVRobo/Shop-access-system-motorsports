@@ -21,15 +21,25 @@ from get_members import update_members_csv
 # --------------------------
 # Configuration
 # --------------------------
-_BASE_DIR = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(_BASE_DIR, ".env"))
+# _ASSET_DIR: where bundled read-only files live (.env baked in by PyInstaller).
+# When frozen, PyInstaller extracts bundled files to sys._MEIPASS (a temp dir).
+# When running as a plain script, assets live next to the source file.
+_ASSET_DIR = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+
+# _DATA_DIR: where writable runtime files live (logs, CSVs).
+# When frozen, use the directory containing the .exe so files land somewhere
+# the user owns — not system32 or a temp folder.
+# When running as a plain script, same directory as the source file.
+_DATA_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+
+load_dotenv(os.path.join(_ASSET_DIR, ".env"))
 
 SLACK_BOT_TOKEN     = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN     = os.getenv("SLACK_APP_TOKEN")
 ANNOUNCE_CHANNEL_ID = "C09MS0MFKBK"
 ADMIN_SLACK_ID      = "U07U7V298Q2"
-MEMBERS_FILE        = "members.csv"
-ATTENDANCE_FILE   = "attendance.csv"
+MEMBERS_FILE        = os.path.join(_DATA_DIR, "members.csv")
+ATTENDANCE_FILE   = os.path.join(_DATA_DIR, "attendance.csv")
 ATTENDANCE_HEADERS = ["card_uid", "member_name", "check_in", "check_out", "hours", "approved"]
 
 
@@ -138,7 +148,7 @@ def setup_logging():
     log_format = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
     file_handler = RotatingFileHandler(
-        "bot.log", maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        os.path.join(_DATA_DIR, "bot.log"), maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
     file_handler.setFormatter(log_format)
 
@@ -944,7 +954,7 @@ def handle_announcement_casual(event, slack_id):
     if slack_id != ADMIN_SLACK_ID:
         reply(event, "You're not authorized to use this command.")
         return
-    USE_FORMAL_MODE = True
+    USE_FORMAL_MODE = False
     logger.info("Casual announcement mode restored")
     reply(event, "Casual mode restored. Shop-open announcements will use random messages again.")
 

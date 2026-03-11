@@ -10,12 +10,13 @@ from dotenv import load_dotenv
 
 # When running as a PyInstaller bundle, data files live in sys._MEIPASS.
 # When running normally, they live next to this script.
-_BASE_DIR = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(_BASE_DIR, ".env"))
+_ASSET_DIR = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR  = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_ASSET_DIR, ".env"))
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 MEMBERS_CHANNEL_ID = "C09HVFVPCN9"
-MEMBERS_FILE = "members.csv"
+MEMBERS_FILE = os.path.join(_DATA_DIR, "members.csv")
 MEMBERS_HEADERS = ["card_uid", "member_name", "slack_id", "seniority", "lead_slack_id"]
 
 DEFAULT_SENIORITY = 5  # 1 = most senior, 5 = most junior
