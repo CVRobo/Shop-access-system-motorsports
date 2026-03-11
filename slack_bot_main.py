@@ -944,7 +944,7 @@ def handle_announcement_casual(event, slack_id):
     if slack_id != ADMIN_SLACK_ID:
         reply(event, "You're not authorized to use this command.")
         return
-    USE_FORMAL_MODE = False
+    USE_FORMAL_MODE = True
     logger.info("Casual announcement mode restored")
     reply(event, "Casual mode restored. Shop-open announcements will use random messages again.")
 
