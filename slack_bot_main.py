@@ -40,7 +40,7 @@ ANNOUNCE_CHANNEL_ID = "C09MS0MFKBK"
 ADMIN_SLACK_ID      = "U07U7V298Q2"
 MEMBERS_FILE        = os.path.join(_DATA_DIR, "members.csv")
 ATTENDANCE_FILE   = os.path.join(_DATA_DIR, "attendance.csv")
-ATTENDANCE_HEADERS = ["card_uid", "member_name", "check_in", "check_out", "hours", "approved"]
+ATTENDANCE_HEADERS = ["member_name", "check_in_date", "check_in_time", "check_out_date", "check_out_time", "hours", "approved"]
 
 
 # --------------------------
@@ -203,22 +203,43 @@ def read_attendance_rows():
 def write_attendance_rows(rows):
     _atomic_write_csv(ATTENDANCE_FILE, ATTENDANCE_HEADERS, rows)
 
+
+def dt_to_row(dt):
+    """Return (date_str, time_str) for a datetime, or ("", "") if None."""
+    if dt is None:
+        return "", ""
+    return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S")
+
+def row_to_dt(row, prefix):
+    """Reconstruct a datetime from split date/time columns. Returns None if missing."""
+    d = row.get(f"{prefix}_date", "").strip()
+    t = row.get(f"{prefix}_time", "").strip()
+    if not d:
+        return None
+    try:
+        return datetime.fromisoformat(f"{d} {t}" if t else d)
+    except (ValueError, TypeError):
+        return None
+
 def append_session(card_uid, name, check_in_dt):
     """Append a new check-in row. Uses atomic write to avoid corruption."""
+    ci_date, ci_time = dt_to_row(check_in_dt)
     rows = read_attendance_rows()
     rows.append({
-        "card_uid":    card_uid,
-        "member_name": name,
-        "check_in":    check_in_dt.isoformat(),
-        "check_out":   "",
-        "hours":       "0.0",
-        "approved":    "False",
+        "member_name":   name,
+        "check_in_date": ci_date,
+        "check_in_time": ci_time,
+        "check_out_date": "",
+        "check_out_time": "",
+        "hours":          "0.0",
+        "approved":       "False",
     })
     write_attendance_rows(rows)
 
-def get_open_session(card_uid):
+def get_open_session(member_name):
+    """Find the most recent open session for a member by name."""
     for row in reversed(read_attendance_rows()):
-        if row["card_uid"] == card_uid and not row["check_out"].strip():
+        if row["member_name"].strip().lower() == member_name.strip().lower()                 and not row.get("check_out_date", "").strip():
             return row
     return None
 
@@ -231,14 +252,14 @@ def close_open_session(card_uid, member_name, checkout_dt):
     target = None
 
     for i in range(len(rows) - 1, -1, -1):
-        if rows[i]["card_uid"] == card_uid and not rows[i]["check_out"].strip():
+        if rows[i]["card_uid"] == card_uid and not rows[i].get("check_out_date", "").strip():
             target = i
             break
 
     if target is None:
         for i in range(len(rows) - 1, -1, -1):
             if rows[i]["member_name"].strip().lower() == member_name.strip().lower() \
-                    and not rows[i]["check_out"].strip():
+                    and not rows[i].get("check_out_date", "").strip():
                 target = i
                 break
 
@@ -254,7 +275,9 @@ def close_open_session(card_uid, member_name, checkout_dt):
         t1 = None
 
     hours = round((checkout_dt - t1).total_seconds() / 3600, 2) if t1 else 0.0
-    row["check_out"] = checkout_dt.isoformat()
+    co_date, co_time = dt_to_row(checkout_dt)
+    row["check_out_date"] = co_date
+    row["check_out_time"] = co_time
     row["hours"]     = hours
     row["approved"]  = "False"
     write_attendance_rows(rows)
@@ -327,7 +350,7 @@ def rebuild_current_members():
     seen_names = set()
 
     for row in reversed(rows):
-        if row.get("check_out", "").strip():
+        if row.get("check_out_date", "").strip():
             continue  # already closed
 
         name = row.get("member_name", "").strip()
@@ -336,21 +359,21 @@ def rebuild_current_members():
         seen_names.add(name)
 
         try:
-            check_in_dt = datetime.fromisoformat(row["check_in"])
+            check_in_dt = row_to_dt(row, "check_in")
             age_hours = (now - check_in_dt).total_seconds() / 3600
         except (ValueError, TypeError):
             age_hours = 0
 
         if age_hours > STALE_SESSION_HOURS:
-            stale.append((name, row["check_in"], round(age_hours, 1)))
+            stale.append((name, f"{row.get('check_in_date','')} {row.get('check_in_time','')}".strip(), round(age_hours, 1)))
             logger.warning(
-                f"Stale open session found for {name} (checked in {row['check_in']}, "
+                f"Stale open session found for {name} (checked in {row.get('check_in_date','')} {row.get('check_in_time','')}, "
                 f"{round(age_hours, 1)}h ago) — NOT restoring to CURRENT_MEMBERS."
             )
         else:
             CURRENT_MEMBERS.add(name)
             recovered.append(name)
-            logger.info(f"Restored {name} to CURRENT_MEMBERS (session started {row['check_in']})")
+            logger.info(f"Restored {name} to CURRENT_MEMBERS (session started {row.get('check_in_date','')} {row.get('check_in_time','')})")
 
     if recovered:
         logger.info(f"Recovered {len(recovered)} active session(s) after restart: {', '.join(recovered)}")
@@ -443,7 +466,7 @@ def find_notify_target(check_in_iso, checkout_dt, checking_out_member, members):
             continue
 
         try:
-            row_checkin = datetime.fromisoformat(row["check_in"])
+            row_checkin = row_to_dt(row, "check_in")
         except (ValueError, TypeError):
             continue
 
@@ -451,7 +474,7 @@ def find_notify_target(check_in_iso, checkout_dt, checking_out_member, members):
         if row_checkin < window_start:
             continue
 
-        row_checkout_str = row.get("check_out", "").strip()
+        row_checkout_str = row.get("check_out_date", "").strip()
         if row_checkout_str:
             try:
                 row_checkout = datetime.fromisoformat(row_checkout_str)
@@ -562,7 +585,7 @@ def _watchdog_tick():
         # Find their open session
         open_row = None
         for row in reversed(read_attendance_rows()):
-            if row.get("member_name", "").strip() == name and not row.get("check_out", "").strip():
+            if row.get("member_name", "").strip() == name and not row.get("check_out_date", "").strip():
                 open_row = row
                 break
 
@@ -570,7 +593,7 @@ def _watchdog_tick():
             continue
 
         try:
-            check_in_dt = datetime.fromisoformat(open_row["check_in"])
+            check_in_dt = row_to_dt(open_row, "check_in")
         except (ValueError, TypeError):
             continue
 
@@ -743,9 +766,10 @@ def handle_check_in(event, member):
     if existing or name in CURRENT_MEMBERS:
         if existing:
             try:
-                since = datetime.fromisoformat(existing["check_in"]).strftime("%Y-%m-%d %H:%M:%S")
+                ci_dt = row_to_dt(existing, "check_in")
+                since = ci_dt.strftime("%Y-%m-%d %H:%M:%S") if ci_dt else "unknown"
             except (ValueError, TypeError):
-                since = existing.get("check_in", "unknown")
+                since = f"{existing.get('check_in_date','')} {existing.get('check_in_time','')}".strip() or "unknown"
             reply(event, f"You are already checked in since {since}. Please `check out` first.")
         else:
             reply(event, "You are already checked in. Please `check out` first.")
@@ -845,7 +869,7 @@ def handle_admin_force_checkout(event, slack_id, parts, members):
     target_idx = None
     for i in range(len(rows) - 1, -1, -1):
         if rows[i]["member_name"].strip().lower() == target_name_input.strip().lower() \
-                and not rows[i]["check_out"].strip():
+                and not rows[i].get("check_out_date", "").strip():
             target_idx = i
             break
 
@@ -857,14 +881,16 @@ def handle_admin_force_checkout(event, slack_id, parts, members):
     target_name = row["member_name"].strip()  # canonical casing from CSV
 
     try:
-        t1 = datetime.fromisoformat(row["check_in"])
+        t1 = row_to_dt(row, "check_in")
         hrs = round((checkout_time - t1).total_seconds() / 3600, 2)
     except (ValueError, TypeError):
         hrs = 0.0
 
-    row["check_out"] = checkout_time.isoformat()
-    row["hours"]     = hrs
-    row["approved"]  = "False"
+    co_date, co_time = dt_to_row(checkout_time)
+    row["check_out_date"] = co_date
+    row["check_out_time"] = co_time
+    row["hours"]          = hrs
+    row["approved"]       = "False"
     write_attendance_rows(rows)
 
     CURRENT_MEMBERS.discard(target_name)
@@ -1016,7 +1042,7 @@ def get_sessions_this_year(member_name, include_disapproved=False):
             continue
 
         try:
-            check_in_dt = datetime.fromisoformat(row["check_in"])
+            check_in_dt = row_to_dt(row, "check_in")
         except (ValueError, TypeError):
             continue
 
@@ -1106,14 +1132,16 @@ def format_hours_report(sessions, include_disapproved=False):
             status = "❌ Disapproved"
 
         try:
-            ci = datetime.fromisoformat(row["check_in"]).strftime("%b %d  %H:%M")
+            ci_dt = row_to_dt(row, "check_in")
+            ci = ci_dt.strftime("%b %d  %H:%M") if ci_dt else row.get("check_in_date", "?")
         except (ValueError, TypeError):
-            ci = row.get("check_in", "?")
+            ci = f"{row.get('check_in_date','?')}".strip()
 
         try:
-            co = datetime.fromisoformat(row["check_out"]).strftime("%H:%M") if row.get("check_out", "").strip() else "(open)"
+            co_dt = row_to_dt(row, "check_out")
+            co = co_dt.strftime("%H:%M") if co_dt else ("(open)" if not row.get("check_out_date","").strip() else row.get("check_out_date","?"))
         except (ValueError, TypeError):
-            co = row.get("check_out", "?")
+            co = f"{row.get('check_out_date','?')}".strip()
 
         try:
             hrs = f"{float(row.get('hours', 0)):.2f}h"
@@ -1141,7 +1169,10 @@ def get_semester_sessions(member_name, start_date, end_date, include_disapproved
             continue  # skip disapproved
 
         try:
-            ci_date = datetime.fromisoformat(row["check_in"]).date()
+            ci_dt = row_to_dt(row, "check_in")
+            ci_date = ci_dt.date() if ci_dt else None
+            if ci_date is None:
+                continue
         except (ValueError, TypeError):
             continue
 
