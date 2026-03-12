@@ -1098,6 +1098,14 @@ def get_current_semester():
     return None, None, None
 
 
+
+def get_current_week_bounds():
+    """Return (start, end) date for the current Mon–Sun week."""
+    today = datetime.now().date()
+    start = today - timedelta(days=today.weekday())  # Monday
+    end   = start + timedelta(days=6)                # Sunday
+    return start, end
+
 def format_hours_report(sessions, include_disapproved=False):
     """
     Format a list of session rows into a readable report string.
@@ -1347,6 +1355,8 @@ def process_message(client, req):
         handle_is_shop_open(event["channel"])
     elif text_lc == "my hours":
         handle_my_hours(event, member)
+    elif text_lc == "my hours weekly":
+        handle_my_hours(event, member, weekly=True)
     elif text_lc.startswith("hours report "):
         handle_hours_report(event, slack_id, text_lc, members)
     elif "who is in" in text_lc or "who's in" in text_lc:
@@ -1356,7 +1366,7 @@ def process_message(client, req):
             "Available commands:\n"
             "- `check in` / `check out`\n"
             "- `who is in` / `is shop open`\n"
-            "- `my hours`\n"
+            "- `my hours` / `my hours weekly`\n"
             "- `hours report <name>` (seniors/leads only)\n"
             "- `approve pending <name>`\n"
             "- `approve <name> <number>`\n"
