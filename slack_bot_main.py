@@ -245,34 +245,25 @@ def get_open_session(member_name):
 
 def close_open_session(card_uid, member_name, checkout_dt):
     """
-    Find the most recent open session by card_uid, falling back to member_name.
+    Find the most recent open session by member_name.
     Returns (hours, check_in_iso) or (None, None) if no open session found.
+    check_in_iso is a "YYYY-MM-DD HH:MM:SS" string for compatibility with callers.
     """
     rows = read_attendance_rows()
     target = None
 
     for i in range(len(rows) - 1, -1, -1):
-        if rows[i]["card_uid"] == card_uid and not rows[i].get("check_out_date", "").strip():
+        if rows[i]["member_name"].strip().lower() == member_name.strip().lower() \
+                and not rows[i].get("check_out_date", "").strip():
             target = i
             break
-
-    if target is None:
-        for i in range(len(rows) - 1, -1, -1):
-            if rows[i]["member_name"].strip().lower() == member_name.strip().lower() \
-                    and not rows[i].get("check_out_date", "").strip():
-                target = i
-                break
 
     if target is None:
         return None, None
 
     row = rows[target]
-    check_in_iso = row["check_in"]
-
-    try:
-        t1 = datetime.fromisoformat(check_in_iso)
-    except (ValueError, TypeError):
-        t1 = None
+    t1 = row_to_dt(row, "check_in")
+    check_in_iso = f"{row.get('check_in_date', '')} {row.get('check_in_time', '')}".strip()
 
     hours = round((checkout_dt - t1).total_seconds() / 3600, 2) if t1 else 0.0
     co_date, co_time = dt_to_row(checkout_dt)
@@ -281,7 +272,7 @@ def close_open_session(card_uid, member_name, checkout_dt):
     row["hours"]     = hours
     row["approved"]  = "False"
     write_attendance_rows(rows)
-    logger.info(f"Session closed for {member_name}: {check_in_iso} -> {checkout_dt.isoformat()} ({hours}h)")
+    logger.info(f"Session closed for {member_name}: {check_in_iso} -> {co_date} {co_time} ({hours}h)")
     return hours, check_in_iso
 
 def get_unapproved_sessions(member_name):
@@ -937,7 +928,11 @@ def handle_approve_disapprove(event, slack_id, text, members):
             return
         lines = [f"Pending sessions for {target_name}:"]
         for i, (_, row) in enumerate(pending, start=1):
-            lines.append(f"{i}. check_in: {row['check_in']}  check_out: {row['check_out'] or '(open)'}  hours: {row['hours'] or '0.0'}")
+            ci_dt = row_to_dt(row, "check_in")
+            co_dt = row_to_dt(row, "check_out")
+            ci_str = ci_dt.strftime("%Y-%m-%d %H:%M") if ci_dt else "?"
+            co_str = co_dt.strftime("%H:%M") if co_dt else "(open)"
+            lines.append(f"{i}. check_in: {ci_str}  check_out: {co_str}  hours: {row.get('hours') or '0.0'}")
         lines += ["", "- `approve <name> <number>` to approve", "- `disapprove <name> <number>` to remove"]
         reply(event, "\n".join(lines))
         return
