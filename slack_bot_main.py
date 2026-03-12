@@ -401,10 +401,27 @@ def load_members():
     if not os.path.exists(MEMBERS_FILE):
         return {}
     with open(MEMBERS_FILE, "r", newline="") as f:
-        return {
-            row["slack_id"].strip(): {k: v.strip() for k, v in row.items()}
-            for row in csv.DictReader(f)
-        }
+        result = {}
+        for row in csv.DictReader(f):
+            # Guard against None or list values — can happen with duplicate/missing
+            # CSV headers where DictReader returns a list instead of a string.
+            cleaned = {
+                k: (v.strip() if isinstance(v, str) else (v[0].strip() if isinstance(v, list) and v else ""))
+                for k, v in row.items()
+                if k is not None
+            }
+            slack_id = cleaned.get("slack_id", "")
+            if slack_id:
+                result[slack_id] = cleaned
+        return result
+
+
+MEMBERS_HEADERS = ["card_uid", "member_name", "slack_id", "seniority", "lead_slack_id"]
+
+def write_members(members_dict):
+    """Atomically write members dict back to members.csv."""
+    rows = list(members_dict.values())
+    _atomic_write_csv(MEMBERS_FILE, MEMBERS_HEADERS, rows)
 
 def get_seniority(member):
     """1 = most senior, 5 = most junior. Defaults to 5 on bad data."""
@@ -965,6 +982,111 @@ def handle_approve_disapprove(event, slack_id, text, members):
     ))
 
 
+def handle_set_member_field(event, slack_id, text_lc, members):
+    """
+    `set seniority <name> <1-5>`   — change a member's seniority number
+    `set lead <name> <lead name>`  — assign a lead by name
+    `set lead <name> none`         — clear a member's lead
+
+    Available to seniority-1 members and admin.
+    """
+    approver = members.get(slack_id)
+    is_seniority_1 = approver and get_seniority(approver) == 1
+    is_admin = slack_id == ADMIN_SLACK_ID
+
+    if not is_seniority_1 and not is_admin:
+        reply(event, "You're not authorized. Only seniority-1 members or the admin can use this command.")
+        return
+
+    parts = text_lc.split(None, 2)  # ["set", "seniority"|"lead", "rest..."]
+    if len(parts) < 3:
+        reply(event, "Usage:\n- `set seniority <n> <1-5>`\n- `set lead <n> <lead name>`\n- `set lead <n> none`")
+        return
+
+    subcmd = parts[1]  # "seniority" or "lead"
+    rest   = parts[2]  # "<name> <value>"
+
+    # --- set seniority <name> <1-5> ---
+    if subcmd == "seniority":
+        # Last token is the number, everything before is the name
+        tokens = rest.rsplit(None, 1)
+        if len(tokens) < 2 or not tokens[1].isdigit():
+            reply(event, "Usage: `set seniority <member name> <1-5>`")
+            return
+        target_name_lc = tokens[0].strip()
+        new_seniority  = int(tokens[1])
+        if not (1 <= new_seniority <= 5):
+            reply(event, "Seniority must be between 1 and 5.")
+            return
+
+        target = next(
+            (m for m in members.values() if m["member_name"].strip().lower() == target_name_lc),
+            None
+        )
+        if not target:
+            reply(event, f"Member '{tokens[0]}' not found.")
+            return
+
+        old_val = target.get("seniority", "?")
+        target["seniority"] = str(new_seniority)
+        write_members(members)
+        logger.info(f"{approver['member_name']} set seniority for {target['member_name']}: {old_val} -> {new_seniority}")
+        reply(event, f"Updated seniority for {target['member_name']}: {old_val} → {new_seniority}")
+        return
+
+    # --- set lead <name> <lead name | none> ---
+    if subcmd == "lead":
+        # Try to split off the last word(s) as the lead name.
+        # Strategy: try matching the last 1, 2, then 3 tokens as a lead name.
+        # If none match, and the last token is "none", clear the lead.
+        rest_tokens = rest.split()
+
+        # Check for "none" clear
+        if rest_tokens[-1].lower() == "none":
+            target_name_lc = " ".join(rest_tokens[:-1]).strip()
+            target = next(
+                (m for m in members.values() if m["member_name"].strip().lower() == target_name_lc),
+                None
+            )
+            if not target:
+                reply(event, f"Member '{target_name_lc}' not found.")
+                return
+            target["lead_slack_id"] = ""
+            write_members(members)
+            logger.info(f"{approver['member_name']} cleared lead for {target['member_name']}")
+            reply(event, f"Cleared lead for {target['member_name']}.")
+            return
+
+        # Try splitting at different points to find a valid (target, lead) pair
+        matched_target = matched_lead = None
+        for split_at in range(1, len(rest_tokens)):
+            candidate_target = " ".join(rest_tokens[:split_at]).lower()
+            candidate_lead   = " ".join(rest_tokens[split_at:]).lower()
+            t = next((m for m in members.values() if m["member_name"].strip().lower() == candidate_target), None)
+            l = next((m for m in members.values() if m["member_name"].strip().lower() == candidate_lead),   None)
+            if t and l:
+                matched_target = t
+                matched_lead   = l
+                break
+
+        if not matched_target or not matched_lead:
+            reply(event, "Could not match both a target member and a lead member from that command.\n"
+                         "Usage: `set lead <member name> <lead name>` or `set lead <member name> none`")
+            return
+
+        if matched_target["slack_id"] == matched_lead["slack_id"]:
+            reply(event, "A member can't be their own lead.")
+            return
+
+        matched_target["lead_slack_id"] = matched_lead["slack_id"]
+        write_members(members)
+        logger.info(f"{approver['member_name']} set lead for {matched_target['member_name']} -> {matched_lead['member_name']}")
+        reply(event, f"Set lead for {matched_target['member_name']} → {matched_lead['member_name']}.")
+        return
+
+    reply(event, "Unknown subcommand. Use `set seniority` or `set lead`.")
+
+
 def handle_announcement_formal(event, slack_id):
     global USE_FORMAL_MODE
     if slack_id != ADMIN_SLACK_ID:
@@ -1345,6 +1467,8 @@ def process_message(client, req):
             handle_admin_force_checkout(event, slack_id, parts, members)
         else:
             reply(event, "Unknown admin command. Available: `admin force checkout <name>`")
+    elif text_lc.startswith("set seniority ") or text_lc.startswith("set lead "):
+        handle_set_member_field(event, slack_id, text_lc, members)
     elif text_lc.startswith("approve ") or text_lc.startswith("disapprove "):
         handle_approve_disapprove(event, slack_id, text, members)
     elif text_lc == "announcement formal":
