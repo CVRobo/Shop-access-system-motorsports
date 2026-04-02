@@ -15,7 +15,7 @@ _DATA_DIR  = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) el
 load_dotenv(os.path.join(_ASSET_DIR, ".env"))
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-MEMBERS_CHANNEL_ID = "C09HVFVPCN9"
+MEMBERS_CHANNEL_ID = "C06CT1ZTYUS"
 MEMBERS_FILE = os.path.join(_DATA_DIR, "members.csv")
 MEMBERS_HEADERS = ["card_uid", "member_name", "slack_id", "seniority", "lead_slack_id"]
 
