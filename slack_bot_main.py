@@ -1119,10 +1119,7 @@ def handle_set_member_field(event, slack_id, text_lc, members):
             reply(event, "Seniority must be between 1 and 5.")
             return
 
-        target = next(
-            (m for m in members.values() if m["member_name"].strip().lower() == target_name_lc),
-            None
-        )
+        target = resolve_member(tokens[0].strip(), members)
         if not target:
             reply(event, f"Member '{tokens[0]}' not found.")
             return
