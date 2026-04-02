@@ -22,16 +22,8 @@ from get_members import update_members_csv
 # --------------------------
 # Configuration
 # --------------------------
-# _ASSET_DIR: where bundled read-only files live (.env baked in by PyInstaller).
-# When frozen, PyInstaller extracts bundled files to sys._MEIPASS (a temp dir).
-# When running as a plain script, assets live next to the source file.
 _ASSET_DIR = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-
-# _DATA_DIR: where writable runtime files live (logs, CSVs).
-# When frozen, use the directory containing the .exe so files land somewhere
-# the user owns — not system32 or a temp folder.
-# When running as a plain script, same directory as the source file.
-_DATA_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR  = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 
 load_dotenv(os.path.join(_ASSET_DIR, ".env"))
 
@@ -40,38 +32,34 @@ SLACK_APP_TOKEN     = os.getenv("SLACK_APP_TOKEN")
 ANNOUNCE_CHANNEL_ID = "C09MS0MFKBK"
 ADMIN_SLACK_ID      = "U07U7V298Q2"
 MEMBERS_FILE        = os.path.join(_DATA_DIR, "members.csv")
-ATTENDANCE_FILE   = os.path.join(_DATA_DIR, "attendance.csv")
-ATTENDANCE_HEADERS = ["session_id", "member_name", "check_in_date", "check_in_time", "check_out_date", "check_out_time", "hours", "approved"]
-
+ATTENDANCE_FILE     = os.path.join(_DATA_DIR, "attendance.csv")
+ATTENDANCE_HEADERS  = ["session_id", "member_name", "check_in_date", "check_in_time",
+                        "check_out_date", "check_out_time", "hours", "approved"]
 
 # --------------------------
 # Semester configuration (Stony Brook University academic calendar)
-# Adjust the month/day boundaries here if dates shift year to year.
-# Winter crosses the calendar year boundary — handled automatically.
 # --------------------------
 SEMESTERS = {
     "Winter": {
         "ranges": [
-            (12, 21, 12, 31),  # Dec 21 – Dec 31  (current year)
-            (1,   1,  1, 26),  # Jan  1 – Jan 26  (next year, same winter)
+            (12, 21, 12, 31),
+            (1,   1,  1, 26),
         ]
     },
-    "Spring": {"ranges": [(1, 27, 5, 31)]},   # Jan 27 – May 31
-    "Summer": {"ranges": [(6,  1, 8, 14)]},   # Jun  1 – Aug 14
-    "Fall":   {"ranges": [(8, 15, 12, 20)]},  # Aug 15 – Dec 20
+    "Spring": {"ranges": [(1, 27, 5, 31)]},
+    "Summer": {"ranges": [(6,  1, 8, 14)]},
+    "Fall":   {"ranges": [(8, 15, 12, 20)]},
 }
 
-# Sessions open longer than this are considered stale (likely left open by a power cut)
 STALE_SESSION_HOURS = 12
-
 
 # --------------------------
 # Session watchdog configuration
 # --------------------------
-SESSION_CHECK_HOURS       = 3     # ping member after this many hours
-SESSION_RESPONSE_MINUTES  = 30    # minutes to wait for a reply before escalating
-SESSION_AUTO_CHECKOUT_HOURS = 8   # hard auto-checkout regardless of confirmations
-WATCHDOG_INTERVAL_SECONDS = 60    # how often the background thread runs
+SESSION_CHECK_HOURS         = 3
+SESSION_RESPONSE_MINUTES    = 30
+SESSION_AUTO_CHECKOUT_HOURS = 8
+WATCHDOG_INTERVAL_SECONDS   = 60
 
 FORMAL_OPEN_MESSAGE = "The shop is now open."
 
@@ -118,21 +106,10 @@ SHOP_OPEN_MESSAGES = [
     "Studio entry barrier de-secured - shop accessible",
 ]
 
-# Live in-memory state
 CURRENT_MEMBERS = set()
 USE_FORMAL_MODE  = False
 
-
-# Watchdog state — keyed by member_name
-# Each entry: {
-#   "stage":          "awaiting_member" | "awaiting_senior" | "confirmed_8h",
-#   "alert_sent_at":  datetime,
-#   "check_in_dt":    datetime,
-#   "senior_slack_id": str | None,   # slack_id of senior we escalated to
-# }
 SESSION_ALERTS = {}
-
-# Maps senior_slack_id -> member_name they are being asked to confirm
 SENIOR_PENDING = {}
 
 web_client    = WebClient(token=SLACK_BOT_TOKEN)
@@ -142,20 +119,13 @@ socket_client = SocketModeClient(app_token=SLACK_APP_TOKEN, web_client=web_clien
 # Logging setup
 # --------------------------
 def setup_logging():
-    """
-    Log to both a rotating file (bot.log, max 2MB, 5 backups) and stdout.
-    This means logs survive restarts and can be inspected after a power cut.
-    """
     log_format = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
     file_handler = RotatingFileHandler(
         os.path.join(_DATA_DIR, "bot.log"), maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
     file_handler.setFormatter(log_format)
-
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(log_format)
-
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.addHandler(file_handler)
@@ -167,12 +137,6 @@ logger = logging.getLogger(__name__)
 # Atomic CSV write
 # --------------------------
 def _atomic_write_csv(filepath, headers, rows):
-    """
-    Write to a temp file in the same directory, then atomically replace
-    the real file via os.replace(). Safe against power loss mid-write —
-    you will always end up with either the old file or the new file, never
-    a half-written one.
-    """
     dirpath = os.path.dirname(os.path.abspath(filepath))
     fd, tmp_path = tempfile.mkstemp(dir=dirpath, suffix=".tmp")
     try:
@@ -204,15 +168,12 @@ def read_attendance_rows():
 def write_attendance_rows(rows):
     _atomic_write_csv(ATTENDANCE_FILE, ATTENDANCE_HEADERS, rows)
 
-
 def dt_to_row(dt):
-    """Return (date_str, time_str) for a datetime, or ("", "") if None."""
     if dt is None:
         return "", ""
     return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S")
 
 def row_to_dt(row, prefix):
-    """Reconstruct a datetime from split date/time columns. Returns None if missing."""
     d = row.get(f"{prefix}_date", "").strip()
     t = row.get(f"{prefix}_time", "").strip()
     if not d:
@@ -223,10 +184,8 @@ def row_to_dt(row, prefix):
         return None
 
 def append_session(card_uid, name, check_in_dt):
-    """Append a new check-in row. Uses atomic write to avoid corruption."""
     ci_date, ci_time = dt_to_row(check_in_dt)
     rows = read_attendance_rows()
-    # session_id is global ever-incrementing — find the current max
     max_id = 0
     for r in rows:
         try:
@@ -234,10 +193,10 @@ def append_session(card_uid, name, check_in_dt):
         except (ValueError, TypeError):
             pass
     rows.append({
-        "session_id":    str(max_id + 1),
-        "member_name":   name,
-        "check_in_date": ci_date,
-        "check_in_time": ci_time,
+        "session_id":     str(max_id + 1),
+        "member_name":    name,
+        "check_in_date":  ci_date,
+        "check_in_time":  ci_time,
         "check_out_date": "",
         "check_out_time": "",
         "hours":          "0.0",
@@ -246,40 +205,31 @@ def append_session(card_uid, name, check_in_dt):
     write_attendance_rows(rows)
 
 def get_open_session(member_name):
-    """Find the most recent open session for a member by name."""
     for row in reversed(read_attendance_rows()):
-        if row["member_name"].strip().lower() == member_name.strip().lower()                 and not row.get("check_out_date", "").strip():
+        if row["member_name"].strip().lower() == member_name.strip().lower() \
+                and not row.get("check_out_date", "").strip():
             return row
     return None
 
 def close_open_session(card_uid, member_name, checkout_dt):
-    """
-    Find the most recent open session by member_name.
-    Returns (hours, check_in_iso) or (None, None) if no open session found.
-    check_in_iso is a "YYYY-MM-DD HH:MM:SS" string for compatibility with callers.
-    """
     rows = read_attendance_rows()
     target = None
-
     for i in range(len(rows) - 1, -1, -1):
         if rows[i]["member_name"].strip().lower() == member_name.strip().lower() \
                 and not rows[i].get("check_out_date", "").strip():
             target = i
             break
-
     if target is None:
         return None, None
-
     row = rows[target]
     t1 = row_to_dt(row, "check_in")
     check_in_iso = f"{row.get('check_in_date', '')} {row.get('check_in_time', '')}".strip()
-
     hours = round((checkout_dt - t1).total_seconds() / 3600, 2) if t1 else 0.0
     co_date, co_time = dt_to_row(checkout_dt)
     row["check_out_date"] = co_date
     row["check_out_time"] = co_time
-    row["hours"]     = hours
-    row["approved"]  = "False"
+    row["hours"]    = hours
+    row["approved"] = "False"
     write_attendance_rows(rows)
     logger.info(f"Session closed for {member_name}: {check_in_iso} -> {co_date} {co_time} ({hours}h)")
     return hours, check_in_iso
@@ -301,10 +251,6 @@ def approve_session(global_index):
     return True
 
 def delete_session(global_index):
-    """
-    Mark a session as Disapproved rather than removing it.
-    This keeps the record visible in `hours report` while hiding it from `my hours`.
-    """
     rows = read_attendance_rows()
     if not (0 <= global_index < len(rows)):
         return False
@@ -330,34 +276,19 @@ def approve_all_sessions(member_name):
 # Startup recovery
 # --------------------------
 def rebuild_current_members():
-    """
-    On startup, scan the attendance CSV for any sessions with no check_out.
-    These represent people who were checked in when the bot last stopped
-    (whether due to a power cut, crash, or normal shutdown).
-
-    Sessions open longer than STALE_SESSION_HOURS are flagged as stale —
-    they are NOT added to CURRENT_MEMBERS since that person almost certainly
-    left. Stale sessions are left open in the CSV so a human can review and
-    close them manually, and the admin is notified.
-    """
     rows = read_attendance_rows()
     now = datetime.now()
     stale = []
     recovered = []
-
-    # Track which names we've already processed so we only act on the most
-    # recent open session per person (handles edge case of duplicate open rows)
     seen_names = set()
 
     for row in reversed(rows):
         if row.get("check_out_date", "").strip():
-            continue  # already closed
-
+            continue
         name = row.get("member_name", "").strip()
         if name in seen_names:
             continue
         seen_names.add(name)
-
         try:
             check_in_dt = row_to_dt(row, "check_in")
             age_hours = (now - check_in_dt).total_seconds() / 3600
@@ -367,21 +298,22 @@ def rebuild_current_members():
         if age_hours > STALE_SESSION_HOURS:
             stale.append((name, f"{row.get('check_in_date','')} {row.get('check_in_time','')}".strip(), round(age_hours, 1)))
             logger.warning(
-                f"Stale open session found for {name} (checked in {row.get('check_in_date','')} {row.get('check_in_time','')}, "
+                f"Stale open session found for {name} (checked in "
+                f"{row.get('check_in_date','')} {row.get('check_in_time','')}, "
                 f"{round(age_hours, 1)}h ago) — NOT restoring to CURRENT_MEMBERS."
             )
         else:
             CURRENT_MEMBERS.add(name)
             recovered.append(name)
-            logger.info(f"Restored {name} to CURRENT_MEMBERS (session started {row.get('check_in_date','')} {row.get('check_in_time','')})")
+            logger.info(f"Restored {name} to CURRENT_MEMBERS (session started "
+                        f"{row.get('check_in_date','')} {row.get('check_in_time','')})")
 
     if recovered:
         logger.info(f"Recovered {len(recovered)} active session(s) after restart: {', '.join(recovered)}")
 
     if stale:
         stale_lines = "\n".join(
-            f"- {name} (checked in {ci}, {age}h ago)"
-            for name, ci, age in stale
+            f"- {name} (checked in {ci}, {age}h ago)" for name, ci, age in stale
         )
         msg = (
             f"⚠️ Bot restarted and found {len(stale)} stale open session(s) "
@@ -403,8 +335,6 @@ def load_members():
     with open(MEMBERS_FILE, "r", newline="") as f:
         result = {}
         for row in csv.DictReader(f):
-            # Guard against None or list values — can happen with duplicate/missing
-            # CSV headers where DictReader returns a list instead of a string.
             cleaned = {
                 k: (v.strip() if isinstance(v, str) else (v[0].strip() if isinstance(v, list) and v else ""))
                 for k, v in row.items()
@@ -415,19 +345,17 @@ def load_members():
                 result[slack_id] = cleaned
         return result
 
-
 MEMBERS_HEADERS = ["card_uid", "member_name", "slack_id", "seniority", "lead_slack_id"]
 
 def write_members(members_dict):
-    """Atomically write members dict back to members.csv."""
     rows = list(members_dict.values())
     _atomic_write_csv(MEMBERS_FILE, MEMBERS_HEADERS, rows)
 
-
 def parse_mention(token):
     """
-    Extract slack_id from a Slack mention token like <@U07U7V298Q2> or <@U07U7V298Q2|name>.
-    Returns the slack_id string, or None if not a mention.
+    Extract a Slack ID from a mention token like <@U07U7V298Q2> or <@U07U7V298Q2|name>.
+    Returns the uppercase Slack ID string, or None if the token is not a mention.
+    Works correctly on lowercased input because it calls .upper() on the captured group.
     """
     m = re.match(r"<@([A-Za-z0-9]+)(?:[|][^>]*)?>", token)
     return m.group(1).upper() if m else None
@@ -435,14 +363,12 @@ def parse_mention(token):
 def resolve_member(token, members):
     """
     Resolve a member from either a @mention token or a plain name string.
+    Handles lowercased mention tokens (from text_lc) correctly via parse_mention.
     Returns the member dict or None.
-    token should be the raw text fragment (may include <@...>).
-    For plain names, pass the full lowercased name string.
     """
     slack_id = parse_mention(token)
     if slack_id:
         return members.get(slack_id)
-    # Plain name fallback
     name_lc = token.strip().lower()
     return next(
         (m for m in members.values() if m["member_name"].strip().lower() == name_lc),
@@ -452,20 +378,18 @@ def resolve_member(token, members):
 def extract_mention_and_rest(text, members):
     """
     Given a string that may start with a @mention or a name, return
-    (member, remainder) where remainder is text after the mention/name.
+    (member, remainder) where remainder is the text after the mention/name.
     Tries @mention first, then falls back to longest-prefix name match.
     """
     tokens = text.split()
     if not tokens:
         return None, text
 
-    # Try @mention as first token
     if tokens[0].startswith("<@"):
         slack_id = parse_mention(tokens[0])
         member = members.get(slack_id) if slack_id else None
         return member, " ".join(tokens[1:]).strip()
 
-    # Try progressively longer name prefixes
     for end in range(len(tokens), 0, -1):
         candidate = " ".join(tokens[:end]).lower()
         m = next(
@@ -478,7 +402,6 @@ def extract_mention_and_rest(text, members):
     return None, text
 
 def get_seniority(member):
-    """1 = most senior, 5 = most junior. Defaults to 5 on bad data."""
     try:
         val = int(member.get("seniority", 5))
         if val < 1 or val > 5:
@@ -504,12 +427,6 @@ def find_most_senior_in_shop(members, exclude_name=None):
     return best["slack_id"]
 
 def find_notify_target(check_in_iso, checkout_dt, checking_out_member, members):
-    """
-    Notification priority for when the shop empties:
-      1. Most senior person co-present during the session (from attendance log)
-      2. Member's designated lead (fallback for solo sessions)
-      3. Admin (last resort if lead is unset)
-    """
     exclude_name = checking_out_member["member_name"]
     lead_id = checking_out_member.get("lead_slack_id", "").strip()
 
@@ -519,32 +436,22 @@ def find_notify_target(check_in_iso, checkout_dt, checking_out_member, members):
         logger.warning(f"Could not parse check_in '{check_in_iso}' for {exclude_name} — falling back to lead/admin.")
         return lead_id or ADMIN_SLACK_ID
 
-    name_to_member = {
-        m["member_name"].strip().lower(): m
-        for m in members.values()
-    }
-
-    # Only look at attendance within a 24h window to avoid false matches
-    # from old sessions on different days
+    name_to_member = {m["member_name"].strip().lower(): m for m in members.values()}
     window_start = checkout_dt - timedelta(hours=24)
-
     co_present = []
+
     for row in read_attendance_rows():
         row_name = row.get("member_name", "").strip()
         if row_name.lower() == exclude_name.strip().lower():
             continue
         if row_name.lower() not in name_to_member:
             continue
-
         try:
             row_checkin = row_to_dt(row, "check_in")
         except (ValueError, TypeError):
             continue
-
-        # Ignore rows outside our 24h window
         if row_checkin < window_start:
             continue
-
         row_checkout_str = row.get("check_out_date", "").strip()
         if row_checkout_str:
             try:
@@ -554,7 +461,6 @@ def find_notify_target(check_in_iso, checkout_dt, checking_out_member, members):
             overlaps = row_checkin < checkout_dt and row_checkout > session_start
         else:
             overlaps = row_checkin < checkout_dt
-
         if overlaps:
             co_present.append(name_to_member[row_name.lower()])
 
@@ -570,49 +476,35 @@ def find_notify_target(check_in_iso, checkout_dt, checking_out_member, members):
     logger.warning(f"No lead set for {exclude_name} — falling back to admin")
     return ADMIN_SLACK_ID
 
-
 # --------------------------
 # Session watchdog
 # --------------------------
 def _auto_checkout_member(name, members):
-    """
-    Force-close an open session for `name`, update CURRENT_MEMBERS,
-    send notifications, and post to the announce channel if shop empties.
-    Called by the watchdog thread — safe to call from outside the main thread.
-    """
     checkout_time = datetime.now()
-
-    # Find the member row so we can look up card_uid
-    member = next(
-        (m for m in members.values() if m["member_name"].strip() == name),
-        None
-    )
+    member = next((m for m in members.values() if m["member_name"].strip() == name), None)
     card_uid = member["card_uid"] if member else "ABC123"
 
     hours, check_in_iso = close_open_session(card_uid, name, checkout_time)
     CURRENT_MEMBERS.discard(name)
     SESSION_ALERTS.pop(name, None)
-
     logger.info(f"Watchdog auto-checked out {name} after no response ({hours}h)")
 
     try:
-        hrs = round((checkout_time - datetime.fromisoformat(check_in_iso)).total_seconds() / 3600, 2)               if check_in_iso else round(hours or 0, 2)
+        hrs = round((checkout_time - datetime.fromisoformat(check_in_iso)).total_seconds() / 3600, 2) \
+              if check_in_iso else round(hours or 0, 2)
     except (ValueError, TypeError):
         hrs = round(hours or 0, 2)
 
-    # Notify the member
     if member:
         post(member["slack_id"],
              f"You have been automatically checked out after no response. "
              f"Hours recorded: {hrs}. If this is incorrect, contact an admin.")
 
-    # Notify whoever should approve + announce if shop is now empty
     if member and check_in_iso:
         if CURRENT_MEMBERS:
             notify_id = find_most_senior_in_shop(members, exclude_name=name)
         else:
             notify_id = find_notify_target(check_in_iso, checkout_time, member, members)
-
         if notify_id:
             post(notify_id,
                  f"{name} was auto-checked out after no response to inactivity check. "
@@ -622,47 +514,31 @@ def _auto_checkout_member(name, members):
     if len(CURRENT_MEMBERS) == 0:
         post(ANNOUNCE_CHANNEL_ID, f"Shop closed. {name} was auto-checked out after inactivity.")
 
-
 def _send_member_alert(name, member_slack_id, elapsed_h):
-    """DM the member asking if they're still in the shop."""
     post(member_slack_id,
          f"You have been checked in for {elapsed_h:.1f} hours. Are you still in the shop?\n"
          f"Reply *y* to confirm, or `check out` if you have left.")
 
-
 def _send_senior_alert(senior_slack_id, member_name, elapsed_h):
-    """DM the most senior other member in shop to confirm on behalf of an unresponsive member."""
     post(senior_slack_id,
          f"{member_name} has been in the shop for {elapsed_h:.1f} hours and has not responded "
          f"to the inactivity check.\n"
          f"Reply *y* if they are still present, or ignore this message to allow auto-checkout "
          f"in {SESSION_RESPONSE_MINUTES} minutes.")
 
-
 def _watchdog_tick():
-    """
-    Called every WATCHDOG_INTERVAL_SECONDS. Checks every member currently
-    in CURRENT_MEMBERS against their open session start time and manages
-    the alert/escalation/auto-checkout lifecycle.
-    """
     if not CURRENT_MEMBERS:
         return
-
     members = load_members()
     now = datetime.now()
-
-    # Snapshot to avoid mutating CURRENT_MEMBERS while iterating
     for name in list(CURRENT_MEMBERS):
-        # Find their open session
         open_row = None
         for row in reversed(read_attendance_rows()):
             if row.get("member_name", "").strip() == name and not row.get("check_out_date", "").strip():
                 open_row = row
                 break
-
         if not open_row:
             continue
-
         try:
             check_in_dt = row_to_dt(open_row, "check_in")
         except (ValueError, TypeError):
@@ -670,58 +546,47 @@ def _watchdog_tick():
 
         elapsed_h = (now - check_in_dt).total_seconds() / 3600
         alert = SESSION_ALERTS.get(name)
-        member = next(
-            (m for m in members.values() if m["member_name"].strip() == name),
-            None
-        )
+        member = next((m for m in members.values() if m["member_name"].strip() == name), None)
         if not member:
             continue
 
-        # --- Hard auto-checkout at SESSION_AUTO_CHECKOUT_HOURS ---
         if elapsed_h >= SESSION_AUTO_CHECKOUT_HOURS:
             logger.info(f"Watchdog: {name} reached {SESSION_AUTO_CHECKOUT_HOURS}h hard limit — auto-checking out.")
-            # Clean up any pending senior confirmation
             if alert and alert.get("senior_slack_id"):
                 SENIOR_PENDING.pop(alert["senior_slack_id"], None)
             _auto_checkout_member(name, members)
             continue
 
-        # --- Stage: no alert sent yet, crossed 3h threshold ---
         if alert is None and elapsed_h >= SESSION_CHECK_HOURS:
             logger.info(f"Watchdog: {name} has been in {elapsed_h:.1f}h — sending check-in ping.")
             SESSION_ALERTS[name] = {
-                "stage":          "awaiting_member",
-                "alert_sent_at":  now,
-                "check_in_dt":    check_in_dt,
+                "stage":           "awaiting_member",
+                "alert_sent_at":   now,
+                "check_in_dt":     check_in_dt,
                 "senior_slack_id": None,
             }
             _send_member_alert(name, member["slack_id"], elapsed_h)
             continue
 
         if alert is None:
-            continue  # under threshold, nothing to do
+            continue
 
         alert_age_min = (now - alert["alert_sent_at"]).total_seconds() / 60
 
-        # --- Stage: awaiting member response, window expired ---
         if alert["stage"] == "awaiting_member" and alert_age_min >= SESSION_RESPONSE_MINUTES:
-            # Try to find most senior OTHER member in shop
             senior_slack_id = find_most_senior_in_shop(members, exclude_name=name)
-
             if senior_slack_id:
                 logger.info(f"Watchdog: {name} did not respond — escalating to senior {senior_slack_id}.")
-                alert["stage"]          = "awaiting_senior"
-                alert["alert_sent_at"]  = now
+                alert["stage"]           = "awaiting_senior"
+                alert["alert_sent_at"]   = now
                 alert["senior_slack_id"] = senior_slack_id
                 SENIOR_PENDING[senior_slack_id] = name
                 _send_senior_alert(senior_slack_id, name, elapsed_h)
             else:
-                # Nobody else in shop — auto-checkout immediately
                 logger.info(f"Watchdog: {name} did not respond and is alone — auto-checking out.")
                 _auto_checkout_member(name, members)
             continue
 
-        # --- Stage: awaiting senior response, window expired ---
         if alert["stage"] == "awaiting_senior" and alert_age_min >= SESSION_RESPONSE_MINUTES:
             logger.info(f"Watchdog: Senior did not respond for {name} — auto-checking out.")
             if alert.get("senior_slack_id"):
@@ -729,18 +594,14 @@ def _watchdog_tick():
             _auto_checkout_member(name, members)
             continue
 
-        # --- Stage: confirmed at 3h, now watching for 8h ---
         if alert["stage"] == "confirmed_8h" and elapsed_h >= SESSION_AUTO_CHECKOUT_HOURS - 0.5:
-            # Fire the 8h check (30 min before hard limit gives time to respond)
             logger.info(f"Watchdog: {name} approaching 8h — sending final check-in ping.")
             alert["stage"]         = "awaiting_member"
             alert["alert_sent_at"] = now
             _send_member_alert(name, member["slack_id"], elapsed_h)
             continue
 
-
 def start_watchdog():
-    """Start the session watchdog as a daemon background thread."""
     def loop():
         logger.info("Session watchdog started.")
         while True:
@@ -749,30 +610,19 @@ def start_watchdog():
             except Exception as e:
                 logger.error(f"Watchdog error: {e}", exc_info=True)
             time.sleep(WATCHDOG_INTERVAL_SECONDS)
-
     t = threading.Thread(target=loop, daemon=True, name="SessionWatchdog")
     t.start()
     return t
 
-
 def confirm_session(name, confirmed_by_slack_id, members):
-    """
-    Called when a member or senior sends `y` to confirm someone is still in shop.
-    Returns True if the confirmation was valid and acted on, False if it was spurious.
-    """
     alert = SESSION_ALERTS.get(name)
     if not alert:
         return False
-
-    # At 8h there's no grace — auto-checkout is always the outcome, don't accept confirmations
     elapsed_h = (datetime.now() - alert["check_in_dt"]).total_seconds() / 3600
     if elapsed_h >= SESSION_AUTO_CHECKOUT_HOURS:
         return False
-
-    # Clear any senior pending entry
     if alert.get("senior_slack_id"):
         SENIOR_PENDING.pop(alert["senior_slack_id"], None)
-
     logger.info(f"Session confirmed for {name} by {confirmed_by_slack_id}.")
     SESSION_ALERTS[name] = {
         "stage":           "confirmed_8h",
@@ -786,7 +636,6 @@ def confirm_session(name, confirmed_by_slack_id, members):
 # Slack posting helpers
 # --------------------------
 def _post_direct(channel, text, retries=3):
-    """Post a message with retry on rate limiting."""
     for attempt in range(retries):
         try:
             web_client.chat_postMessage(channel=channel, text=text)
@@ -808,11 +657,6 @@ def reply(event, text):
     post(event["channel"], text)
 
 def is_authorized_approver(approver_id, target_name, members):
-    """
-    Authorized if the approver is either:
-      - More senior (lower seniority number) than the target, OR
-      - The target's designated lead
-    """
     approver = members.get(approver_id)
     if not approver:
         return False
@@ -846,13 +690,13 @@ def handle_check_in(event, member):
             reply(event, "You are already checked in. Please `check out` first.")
         return
 
-    was_empty = len(CURRENT_MEMBERS) == 0
+    was_empty     = len(CURRENT_MEMBERS) == 0
     check_in_time = datetime.now()
 
     try:
         append_session(card_uid, name, check_in_time)
         CURRENT_MEMBERS.add(name)
-        SESSION_ALERTS.pop(name, None)  # ensure no stale watchdog state
+        SESSION_ALERTS.pop(name, None)
         logger.info(f"{name} checked in at {check_in_time.isoformat()}")
     except Exception as e:
         logger.error(f"Failed to append session for {name}: {e}")
@@ -867,10 +711,10 @@ def handle_check_in(event, member):
 
 
 def handle_check_out(event, member):
-    name     = member["member_name"]
-    card_uid = member["card_uid"]
+    name          = member["member_name"]
+    card_uid      = member["card_uid"]
     checkout_time = datetime.now()
-    members  = load_members()
+    members       = load_members()
 
     hours, check_in_iso = close_open_session(card_uid, name, checkout_time)
 
@@ -891,9 +735,8 @@ def handle_check_out(event, member):
         hrs = round(hours, 2)
 
     CURRENT_MEMBERS.discard(name)
-    SESSION_ALERTS.pop(name, None)  # clear any pending watchdog alert
+    SESSION_ALERTS.pop(name, None)
 
-    # Eboard (seniority 1-2) sessions are auto-approved on checkout
     seniority = get_seniority(member)
     if seniority <= 2:
         count = approve_all_sessions(name)
@@ -921,15 +764,18 @@ def handle_check_out(event, member):
 
 def handle_admin_force_checkout(event, slack_id, parts, members):
     """
-    `admin force checkout <member name>`
+    `admin force checkout <member name or @mention>`
     Available to any seniority-1 member or the designated admin.
-    Lets authorized users manually close a stale open session without
-    the member needing to DM the bot. Useful after a power cut.
+
+    FIXED: parts come from text_lc.split() so mentions are lowercased.
+    We now attempt to resolve the token as a @mention via resolve_member
+    before falling back to a plain-name CSV scan, so both
+    `admin force checkout @mention` and `admin force checkout First Last` work.
     """
     global SENIOR_PENDING
-    approver = members.get(slack_id)
+    approver       = members.get(slack_id)
     is_seniority_1 = approver and get_seniority(approver) == 1
-    is_admin = slack_id == ADMIN_SLACK_ID
+    is_admin       = slack_id == ADMIN_SLACK_ID
 
     if not is_seniority_1 and not is_admin:
         reply(event, "You're not authorized. Only seniority-1 members or the admin can force check out.")
@@ -939,12 +785,17 @@ def handle_admin_force_checkout(event, slack_id, parts, members):
         reply(event, "Usage: `admin force checkout <member name>`")
         return
 
-    target_name_input = " ".join(parts[3:])  # may be lowercase from text_lc
+    raw_target = " ".join(parts[3:]).strip()
     checkout_time = datetime.now()
 
-    # Find the open session — match case-insensitively but use the canonical
-    # name from the CSV row for all subsequent operations so CURRENT_MEMBERS
-    # (which stores properly-cased names) is updated correctly.
+    # FIXED: try to resolve as @mention first (handles lowercased mention from text_lc),
+    # then fall back to a case-insensitive name scan of the open CSV sessions.
+    resolved = resolve_member(raw_target, members)
+    if resolved:
+        target_name_input = resolved["member_name"]
+    else:
+        target_name_input = raw_target  # plain name — CSV scan below handles case-insensitivity
+
     rows = read_attendance_rows()
     target_idx = None
     for i in range(len(rows) - 1, -1, -1):
@@ -954,14 +805,14 @@ def handle_admin_force_checkout(event, slack_id, parts, members):
             break
 
     if target_idx is None:
-        reply(event, f"No open session found for '{target_name_input}'.")
+        reply(event, f"No open session found for '{raw_target}'.")
         return
 
-    row = rows[target_idx]
+    row         = rows[target_idx]
     target_name = row["member_name"].strip()  # canonical casing from CSV
 
     try:
-        t1 = row_to_dt(row, "check_in")
+        t1  = row_to_dt(row, "check_in")
         hrs = round((checkout_time - t1).total_seconds() / 3600, 2)
     except (ValueError, TypeError):
         hrs = 0.0
@@ -987,9 +838,9 @@ def handle_admin_force_checkout(event, slack_id, parts, members):
 
 def handle_approve_disapprove(event, slack_id, text, members):
     """
-    approve @mention / approve <n>          — approve ALL pending sessions
-    disapprove @mention / disapprove <n>    — list pending sessions with session IDs
-    disapprove @mention <id>                — disapprove a specific session by global ID
+    approve @mention / approve <name>           — approve ALL pending sessions
+    disapprove @mention / disapprove <name>     — list pending sessions with session IDs
+    disapprove @mention <id>                    — disapprove a specific session by global ID
     """
     parts = text.split()
     cmd   = parts[0].lower()
@@ -999,13 +850,12 @@ def handle_approve_disapprove(event, slack_id, text, members):
         reply(event, "Usage: `approve @mention` or `disapprove @mention` or `disapprove @mention <session_id>`")
         return
 
-    # For disapprove, check if last token is a session ID
-    trailing_id = None
+    trailing_id     = None
     rest_for_lookup = rest
     if cmd == "disapprove":
         rtokens = rest.split()
         if rtokens and rtokens[-1].isdigit():
-            trailing_id = int(rtokens[-1])
+            trailing_id     = int(rtokens[-1])
             rest_for_lookup = " ".join(rtokens[:-1]).strip()
 
     target, _ = extract_mention_and_rest(rest_for_lookup, members)
@@ -1018,7 +868,6 @@ def handle_approve_disapprove(event, slack_id, text, members):
     approver        = members.get(slack_id)
     approver_seniority = get_seniority(approver) if approver else 99
 
-    # Eboard (seniority 1-2) may approve their own sessions
     is_self = slack_id == target_slack_id
     if is_self and approver_seniority > 2:
         reply(event, "You can't approve your own sessions.")
@@ -1027,7 +876,6 @@ def handle_approve_disapprove(event, slack_id, text, members):
         reply(event, "You're not authorized to approve/disapprove sessions for that member.")
         return
 
-    # --- approve: approve all pending ---
     if cmd == "approve":
         count = approve_all_sessions(target_name)
         if count:
@@ -1036,7 +884,6 @@ def handle_approve_disapprove(event, slack_id, text, members):
             reply(event, f"No pending sessions to approve for {target_name}.")
         return
 
-    # --- disapprove <id>: disapprove specific session by global session_id ---
     if cmd == "disapprove" and trailing_id is not None:
         rows = read_attendance_rows()
         target_idx = None
@@ -1058,7 +905,6 @@ def handle_approve_disapprove(event, slack_id, text, members):
         reply(event, f"Disapproved session #{trailing_id} for {target_name}." if ok else "Failed.")
         return
 
-    # --- disapprove with no id: show list of pending sessions ---
     if cmd == "disapprove":
         pending = get_unapproved_sessions(target_name)
         if not pending:
@@ -1081,47 +927,57 @@ def handle_approve_disapprove(event, slack_id, text, members):
         return
 
 
-
-def handle_set_member_field(event, slack_id, text_lc, members):
+def handle_set_member_field(event, slack_id, text, members):
     """
-    `set seniority <name> <1-5>`   — change a member's seniority number
-    `set lead <name> <lead name>`  — assign a lead by name
-    `set lead <name> none`         — clear a member's lead
+    `set seniority <name or @mention> <1-5>`
+    `set lead <name or @mention> <lead name or @mention>`
+    `set lead <name or @mention> none`
 
     Available to seniority-1 members and admin.
+
+    FIXED (multiple):
+    - Parameter renamed from text_lc to text (receives original-cased text from dispatcher).
+    - subcmd comparison now uses text.lower() split so it's always case-insensitive.
+    - set seniority: uses resolve_member() instead of plain name lookup.
+    - set lead ... none: uses resolve_member() for target instead of plain name lookup.
+    - set lead <target> <lead>: uses extract_mention_and_rest() for both target and lead
+      instead of the split-and-lowercase-compare loop that failed on @mentions.
     """
-    approver = members.get(slack_id)
+    approver       = members.get(slack_id)
     is_seniority_1 = approver and get_seniority(approver) == 1
-    is_admin = slack_id == ADMIN_SLACK_ID
+    is_admin       = slack_id == ADMIN_SLACK_ID
 
     if not is_seniority_1 and not is_admin:
         reply(event, "You're not authorized. Only seniority-1 members or the admin can use this command.")
         return
 
-    parts = text_lc.split(None, 2)  # ["set", "seniority"|"lead", "rest..."]
-    if len(parts) < 3:
-        reply(event, "Usage:\n- `set seniority <n> <1-5>`\n- `set lead <n> <lead name>`\n- `set lead <n> none`")
+    # FIXED: split on the lowercased text for command detection so subcmd is always
+    # lowercase, but keep original `text` for the rest portion so @mentions are
+    # preserved in their original casing for parse_mention() to work correctly.
+    parts_lc = text.lower().split(None, 2)
+    if len(parts_lc) < 3:
+        reply(event, "Usage:\n- `set seniority <name> <1-5>`\n- `set lead <name> <lead name>`\n- `set lead <name> none`")
         return
 
-    subcmd = parts[1]  # "seniority" or "lead"
-    rest   = parts[2]  # "<name> <value>"
+    subcmd = parts_lc[1]                        # always lowercase: "seniority" or "lead"
+    rest   = text.split(None, 2)[2]             # original-cased: preserves <@U...> tokens
 
-    # --- set seniority <name> <1-5> ---
+    # --- set seniority <name or @mention> <1-5> ---
     if subcmd == "seniority":
-        # Last token is the number, everything before is the name
         tokens = rest.rsplit(None, 1)
         if len(tokens) < 2 or not tokens[1].isdigit():
             reply(event, "Usage: `set seniority <member name> <1-5>`")
             return
-        target_name_lc = tokens[0].strip()
-        new_seniority  = int(tokens[1])
+        new_seniority = int(tokens[1])
         if not (1 <= new_seniority <= 5):
             reply(event, "Seniority must be between 1 and 5.")
             return
 
+        # FIXED: was a plain name-only next() lookup; now uses resolve_member()
+        # so both @mentions and plain names work.
         target = resolve_member(tokens[0].strip(), members)
         if not target:
-            reply(event, f"Member '{tokens[0]}' not found.")
+            reply(event, f"Member '{tokens[0].strip()}' not found.")
             return
 
         old_val = target.get("seniority", "?")
@@ -1131,22 +987,17 @@ def handle_set_member_field(event, slack_id, text_lc, members):
         reply(event, f"Updated seniority for {target['member_name']}: {old_val} → {new_seniority}")
         return
 
-    # --- set lead <name> <lead name | none> ---
+    # --- set lead <name or @mention> <lead or none> ---
     if subcmd == "lead":
-        # Try to split off the last word(s) as the lead name.
-        # Strategy: try matching the last 1, 2, then 3 tokens as a lead name.
-        # If none match, and the last token is "none", clear the lead.
         rest_tokens = rest.split()
 
-        # Check for "none" clear
-        if rest_tokens[-1].lower() == "none":
-            target_name_lc = " ".join(rest_tokens[:-1]).strip()
-            target = next(
-                (m for m in members.values() if m["member_name"].strip().lower() == target_name_lc),
-                None
-            )
+        # FIXED: "none" branch was using a plain name-only next() lookup;
+        # now uses resolve_member() so `set lead @mention none` works.
+        if rest_tokens and rest_tokens[-1].lower() == "none":
+            target_str = " ".join(rest_tokens[:-1]).strip()
+            target = resolve_member(target_str, members)
             if not target:
-                reply(event, f"Member '{target_name_lc}' not found.")
+                reply(event, f"Member '{target_str}' not found.")
                 return
             target["lead_slack_id"] = ""
             write_members(members)
@@ -1154,31 +1005,34 @@ def handle_set_member_field(event, slack_id, text_lc, members):
             reply(event, f"Cleared lead for {target['member_name']}.")
             return
 
-        # Try splitting at different points to find a valid (target, lead) pair
-        matched_target = matched_lead = None
-        for split_at in range(1, len(rest_tokens)):
-            candidate_target = " ".join(rest_tokens[:split_at]).lower()
-            candidate_lead   = " ".join(rest_tokens[split_at:]).lower()
-            t = next((m for m in members.values() if m["member_name"].strip().lower() == candidate_target), None)
-            l = next((m for m in members.values() if m["member_name"].strip().lower() == candidate_lead),   None)
-            if t and l:
-                matched_target = t
-                matched_lead   = l
-                break
-
-        if not matched_target or not matched_lead:
-            reply(event, "Could not match both a target member and a lead member from that command.\n"
-                         "Usage: `set lead <member name> <lead name>` or `set lead <member name> none`")
+        # FIXED: was a split-and-lowercase-compare loop that failed for @mentions on
+        # both the target and lead sides. Now uses extract_mention_and_rest() for the
+        # target first, then for the lead from the remainder — handles all combinations
+        # of @mention and plain name for both arguments.
+        target, remainder = extract_mention_and_rest(rest, members)
+        if not target:
+            reply(event, "Could not find target member.\n"
+                         "Usage: `set lead <member> <lead>` or `set lead <member> none`")
             return
 
-        if matched_target["slack_id"] == matched_lead["slack_id"]:
+        if not remainder:
+            reply(event, "Please specify a lead.\n"
+                         "Usage: `set lead <member> <lead>` or `set lead <member> none`")
+            return
+
+        lead, _ = extract_mention_and_rest(remainder, members)
+        if not lead:
+            reply(event, f"Lead member not found: {remainder!r}. Use a @mention or their full name.")
+            return
+
+        if target["slack_id"] == lead["slack_id"]:
             reply(event, "A member can't be their own lead.")
             return
 
-        matched_target["lead_slack_id"] = matched_lead["slack_id"]
+        target["lead_slack_id"] = lead["slack_id"]
         write_members(members)
-        logger.info(f"{approver['member_name']} set lead for {matched_target['member_name']} -> {matched_lead['member_name']}")
-        reply(event, f"Set lead for {matched_target['member_name']} → {matched_lead['member_name']}.")
+        logger.info(f"{approver['member_name']} set lead for {target['member_name']} -> {lead['member_name']}")
+        reply(event, f"Set lead for {target['member_name']} → {lead['member_name']}.")
         return
 
     reply(event, "Unknown subcommand. Use `set seniority` or `set lead`.")
@@ -1220,15 +1074,10 @@ def handle_who_is_in(event):
         reply(event, "No one is currently checked in.")
 
 
-
 # --------------------------
 # Hours report helpers
 # --------------------------
 def get_academic_year_bounds():
-    """
-    Academic year runs Sep 1 – Aug 31.
-    Returns (start_dt, end_dt) for the current academic year.
-    """
     today = datetime.now()
     if today.month >= 9:
         start = datetime(today.year, 9, 1)
@@ -1239,71 +1088,39 @@ def get_academic_year_bounds():
     return start, end
 
 def get_sessions_this_year(member_name, include_disapproved=False):
-    """
-    Return all sessions for member_name within the current academic year.
-    Disapproved sessions (approved == "False" with a completed check_out AND
-    explicitly deleted are already gone from the CSV — but sessions that were
-    force-closed and never touched still show as False.
-
-    For `my hours`: exclude disapproved. A session is considered disapproved
-    only if it was explicitly marked by setting approved = "Disapproved".
-    We write "False" for pending and "True" for approved, so "Disapproved"
-    is a third state we'll use going forward.
-
-    For `hours report`: include everything.
-    """
     start, end = get_academic_year_bounds()
     rows = read_attendance_rows()
     results = []
-
     for row in rows:
         if row["member_name"].strip().lower() != member_name.strip().lower():
             continue
-
         try:
             check_in_dt = row_to_dt(row, "check_in")
         except (ValueError, TypeError):
             continue
-
         if not (start <= check_in_dt <= end):
             continue
-
-        approved_val = str(row.get("approved", "")).strip().lower()
+        approved_val   = str(row.get("approved", "")).strip().lower()
         is_disapproved = approved_val == "disapproved"
-
         if not include_disapproved and is_disapproved:
             continue
-
         results.append(row)
-
     return results
 
 # --------------------------
 # Semester helpers
 # --------------------------
 def get_current_semester():
-    """
-    Return (semester_name, start_date, end_date) for today's date.
-    Winter spans the Dec/Jan year boundary so it is handled specially.
-    Returns (None, None, None) if today falls in a gap between semesters.
-    """
     today = datetime.now().date()
     year  = today.year
 
-    # Build candidate ranges for this year, checking both year and year-1
-    # so winter sessions started in Dec of last year are still caught.
     for sem_name, cfg in SEMESTERS.items():
         for rng in cfg["ranges"]:
             sm, sd, em, ed = rng
             start = datetime(year, sm, sd).date()
             end   = datetime(year, em, ed).date()
 
-            # Winter Dec portion may belong to the *previous* year's winter
             if sem_name == "Winter" and sm == 12:
-                # Also check: did this range start last year?
-                prev_start = datetime(year - 1, sm, sd).date()
-                prev_end   = datetime(year,     em, ed).date() if em < sm else datetime(year - 1, em, ed).date()
-                # The Dec portion of last year's winter
                 dec_start = datetime(year - 1, 12, 21).date()
                 dec_end   = datetime(year - 1, 12, 31).date()
                 jan_start = datetime(year, 1, 1).date()
@@ -1316,31 +1133,21 @@ def get_current_semester():
 
     return None, None, None
 
-
-
 def get_current_week_bounds():
-    """Return (start, end) date for the current Mon–Sun week."""
     today = datetime.now().date()
-    start = today - timedelta(days=today.weekday())  # Monday
-    end   = start + timedelta(days=6)                # Sunday
+    start = today - timedelta(days=today.weekday())
+    end   = start + timedelta(days=6)
     return start, end
 
 def format_hours_report(sessions, include_disapproved=False):
-    """
-    Format a list of session rows into a readable report string.
-    - For members (`include_disapproved=False`): hides disapproved sessions.
-    - For seniors/leads (`include_disapproved=True`): shows all sessions with
-      a [DISAPPROVED] tag so they can see the full picture.
-    Returns (formatted_string, total_approved_hours, total_pending_hours).
-    """
-    lines = []
+    lines          = []
     total_approved = 0.0
     total_pending  = 0.0
 
     for i, row in enumerate(sessions, start=1):
         approved = str(row.get("approved", "")).strip().lower()
 
-        if approved == "false" or approved == "":
+        if approved in ("false", ""):
             status = "⏳ Pending"
             try:
                 total_pending += float(row.get("hours", 0))
@@ -1353,7 +1160,6 @@ def format_hours_report(sessions, include_disapproved=False):
             except (ValueError, TypeError):
                 pass
         else:
-            # "disapproved" / deleted row still in file edge case
             if not include_disapproved:
                 continue
             status = "❌ Disapproved"
@@ -1381,31 +1187,23 @@ def format_hours_report(sessions, include_disapproved=False):
 
 
 def get_semester_sessions(member_name, start_date, end_date, include_disapproved=False):
-    """
-    Return attendance rows for member_name whose check_in falls within
-    [start_date, end_date]. Filters out disapproved rows unless include_disapproved.
-    """
-    rows = read_attendance_rows()
+    rows    = read_attendance_rows()
     results = []
     for row in rows:
         if row.get("member_name", "").strip().lower() != member_name.strip().lower():
             continue
-
         approved = str(row.get("approved", "")).strip().lower()
         if not include_disapproved and approved not in ("true", "false", ""):
-            continue  # skip disapproved
-
+            continue
         try:
-            ci_dt = row_to_dt(row, "check_in")
+            ci_dt   = row_to_dt(row, "check_in")
             ci_date = ci_dt.date() if ci_dt else None
             if ci_date is None:
                 continue
         except (ValueError, TypeError):
             continue
-
         if start_date <= ci_date <= end_date:
             results.append(row)
-
     return results
 
 
@@ -1413,16 +1211,12 @@ def get_semester_sessions(member_name, start_date, end_date, include_disapproved
 # Hours report handlers
 # --------------------------
 def handle_my_info(event, member, members):
-    """
-    `my info` — shows name, seniority, lead, and session summary for current semester.
-    If lead is unset, prompts the member to set it themselves.
-    """
     name      = member["member_name"]
     seniority = get_seniority(member)
     lead_id   = member.get("lead_slack_id", "").strip()
 
     if lead_id:
-        lead = members.get(lead_id)
+        lead     = members.get(lead_id)
         lead_str = lead["member_name"] if lead else f"Unknown ({lead_id})"
     else:
         lead_str = "Not set — use `set my lead @mention` to assign one"
@@ -1430,9 +1224,9 @@ def handle_my_info(event, member, members):
     sem_name, start, end = get_current_semester()
     if sem_name:
         all_sessions = get_semester_sessions(name, start, end, include_disapproved=True)
-        approved   = sum(1 for r in all_sessions if str(r.get("approved","")).lower() == "true")
-        pending    = sum(1 for r in all_sessions if str(r.get("approved","")).lower() in ("false","","none"))
-        total_hrs  = sum(
+        approved  = sum(1 for r in all_sessions if str(r.get("approved","")).lower() == "true")
+        pending   = sum(1 for r in all_sessions if str(r.get("approved","")).lower() in ("false","","none"))
+        total_hrs = sum(
             float(r.get("hours", 0))
             for r in all_sessions
             if str(r.get("approved","")).lower() == "true"
@@ -1456,10 +1250,6 @@ def handle_my_info(event, member, members):
 
 
 def handle_set_my_lead(event, slack_id, text, members):
-    """
-    `set my lead @mention` — member sets their own lead
-    `set my lead none`     — member clears their own lead
-    """
     rest = text.strip()
     if not rest or rest.lower() == "set my lead":
         reply(event, "Usage: `set my lead @mention` or `set my lead none`")
@@ -1490,86 +1280,97 @@ def handle_set_my_lead(event, slack_id, text, members):
 
 
 def handle_feedback(event, slack_id, text, members):
-    """
-    `feedback <message>` — send an anonymous message to the admin.
-    The sender's identity is never included in the forwarded message.
-    """
     msg = text.removeprefix("feedback").strip()
     if not msg:
         reply(event, "Usage: `feedback <your message>`")
         return
-
     _post_direct(ADMIN_SLACK_ID, f"📬 *Anonymous feedback:*\n{msg}")
     reply(event, "Your feedback has been sent anonymously. Thank you.")
-    logger.info(f"Anonymous feedback received (sender identity withheld)")
+    logger.info("Anonymous feedback received (sender identity withheld)")
 
 
-def handle_my_hours(event, member):
+def handle_my_hours(event, member, weekly=False):
     """
-    `my hours`
-    Shows the member their own sessions for the current semester.
-    Disapproved sessions are hidden. Pending sessions show approval status.
+    `my hours`        — current semester summary
+    `my hours weekly` — this Mon–Sun week only
+
+    FIXED: added `weekly` parameter (was missing, causing TypeError when dispatcher
+    called handle_my_hours(event, member, weekly=True)).
     """
     name = member["member_name"]
-    sem_name, start, end = get_current_semester()
 
+    if weekly:
+        start, end = get_current_week_bounds()
+        label      = f"week of {start} – {end}"
+        sessions   = get_semester_sessions(name, start, end, include_disapproved=False)
+        if not sessions:
+            reply(event, f"No sessions recorded for you this week ({start} – {end}).")
+            return
+        body, approved_hrs, pending_hrs = format_hours_report(sessions, include_disapproved=False)
+        reply(event, (
+            f"Your hours — {label}:\n\n"
+            f"{body}\n\n"
+            f"Approved: {approved_hrs}h  |  Pending approval: {pending_hrs}h"
+        ))
+        return
+
+    sem_name, start, end = get_current_semester()
     if sem_name is None:
         reply(event, "Could not determine the current semester. Contact an admin.")
         return
 
     sessions = get_semester_sessions(name, start, end, include_disapproved=False)
-
     if not sessions:
         reply(event, f"No sessions recorded for you this {sem_name} semester ({start} – {end}).")
         return
 
     body, approved_hrs, pending_hrs = format_hours_report(sessions, include_disapproved=False)
-
     reply(event, (
-        f"Your hours \u2014 {sem_name} {start.year} ({start} \u2013 {end}):\n\n"
+        f"Your hours — {sem_name} {start.year} ({start} – {end}):\n\n"
         f"{body}\n\n"
         f"Approved: {approved_hrs}h  |  Pending approval: {pending_hrs}h"
     ))
 
 
-def handle_hours_report(event, slack_id, text_lc, members):
+def handle_hours_report(event, slack_id, text, members):
     """
-    `hours report <member name>`
+    `hours report <member name or @mention>`
     Available to anyone more senior than the target, or their designated lead.
-    Shows all sessions including disapproved ones, with full status breakdown.
+
+    FIXED: parameter renamed from text_lc to text (receives original-cased text).
+    Now uses extract_mention_and_rest() to resolve the target before doing any
+    authorization check, so `hours report @mention` correctly resolves the member
+    instead of comparing the raw mention string against member names and failing.
     """
-    target_name = text_lc.removeprefix("hours report ").strip()
-    if not target_name:
+    raw = text.split(None, 2)[2].strip() if len(text.split(None, 2)) >= 3 else ""
+    if not raw:
         reply(event, "Usage: `hours report <member name>`")
         return
 
-    if not is_authorized_approver(slack_id, target_name, members):
-        reply(event, "You're not authorized to view hours for that member.")
-        return
-
-    target = next(
-        (m for m in members.values() if m["member_name"].strip().lower() == target_name.lower()),
-        None
-    )
+    # FIXED: was text_lc.removeprefix("hours report ").strip() followed by a plain
+    # name-only next() lookup — both failed for @mentions.
+    target, _ = extract_mention_and_rest(raw, members)
     if not target:
-        reply(event, f"Member '{target_name}' not found.")
+        reply(event, f"Member not found: {raw!r}. Use a @mention or their full name.")
         return
 
     display_name = target["member_name"]
-    sem_name, start, end = get_current_semester()
 
+    if not is_authorized_approver(slack_id, display_name, members):
+        reply(event, "You're not authorized to view hours for that member.")
+        return
+
+    sem_name, start, end = get_current_semester()
     if sem_name is None:
         reply(event, "Could not determine the current semester. Contact an admin.")
         return
 
     sessions = get_semester_sessions(display_name, start, end, include_disapproved=True)
-
     if not sessions:
         reply(event, f"No sessions found for {display_name} this {sem_name} semester ({start} – {end}).")
         return
 
     body, approved_hrs, pending_hrs = format_hours_report(sessions, include_disapproved=True)
-
     reply(event, (
         f"Hours report for {display_name} — {sem_name} {start.year} ({start} – {end}):\n\n"
         f"{body}\n\n"
@@ -1620,21 +1421,18 @@ def process_message(client, req):
     logger.info(f"Command from {member['member_name']} ({slack_id}): {text!r}")
 
     # Watchdog confirmation — member or senior replying "y"
-    if text_lc in ("y",):
+    if text_lc == "y":
         name = member["member_name"]
-        # Check if this person is themselves awaiting confirmation
-        if name in SESSION_ALERTS and SESSION_ALERTS[name]["stage"] in ("awaiting_member",):
+        if name in SESSION_ALERTS and SESSION_ALERTS[name]["stage"] == "awaiting_member":
             ok = confirm_session(name, slack_id, members)
             if ok:
                 reply(event, "Got it — session extended. We'll check in again closer to 8 hours.")
             return
-        # Check if this person is a senior being asked to confirm someone else
         if slack_id in SENIOR_PENDING:
             target_name = SENIOR_PENDING[slack_id]
             ok = confirm_session(target_name, slack_id, members)
             if ok:
                 reply(event, f"Confirmed — {target_name}'s session has been extended.")
-                # Also notify the member their session was confirmed by someone else
                 target_member = next(
                     (m for m in members.values() if m["member_name"].strip() == target_name),
                     None
@@ -1644,8 +1442,7 @@ def process_message(client, req):
                          f"Your session was confirmed by a senior member. "
                          f"You will be checked out automatically at 8 hours if you don't respond to the next check.")
             return
-        # Spurious y — ignore silently
-        return
+        return  # spurious "y" — ignore silently
 
     if "check in" in text_lc:
         handle_check_in(event, member)
@@ -1659,6 +1456,7 @@ def process_message(client, req):
     elif text_lc.startswith("set my lead"):
         handle_set_my_lead(event, slack_id, text, members)
     elif text_lc.startswith("set seniority ") or text_lc.startswith("set lead "):
+        # Pass original `text` so @mentions are preserved for parse_mention()
         handle_set_member_field(event, slack_id, text, members)
     elif text_lc.startswith("approve ") or text_lc.startswith("disapprove "):
         handle_approve_disapprove(event, slack_id, text, members)
@@ -1670,11 +1468,14 @@ def process_message(client, req):
         handle_is_shop_open(event["channel"])
     elif text_lc == "my info":
         handle_my_info(event, member, members)
+    elif text_lc == "my hours weekly":
+        # FIXED: was calling handle_my_hours(event, member, weekly=True) but the old
+        # function signature was handle_my_hours(event, member) — TypeError every time.
+        handle_my_hours(event, member, weekly=True)
     elif text_lc == "my hours":
         handle_my_hours(event, member)
-    elif text_lc == "my hours weekly":
-        handle_my_hours(event, member, weekly=True)
     elif text_lc.startswith("hours report "):
+        # Pass original `text` so @mentions are preserved for parse_mention()
         handle_hours_report(event, slack_id, text, members)
     elif text_lc.startswith("feedback "):
         handle_feedback(event, slack_id, text, members)
@@ -1700,7 +1501,6 @@ def process_message(client, req):
             "- `disapprove @mention` — list pending sessions with IDs\n"
             "- `disapprove @mention <session_id>` — disapprove a specific session\n"
             "- `hours report @mention` — full semester report\n"
-            "- `hours report weekly @mention` — this week's report\n"
             "\n"
             "*Settings*\n"
             "- `set my lead @mention` / `set my lead none`\n"
@@ -1720,7 +1520,6 @@ def process_message(client, req):
 # --------------------------
 def handle_shutdown(signum, frame):
     logger.info(f"Received signal {signum}. Shutting down gracefully...")
-    # Log who is still checked in so it's easy to reconstruct state
     if CURRENT_MEMBERS:
         logger.info(f"Members still checked in at shutdown: {', '.join(sorted(CURRENT_MEMBERS))}")
     sys.exit(0)
@@ -1751,7 +1550,6 @@ else:
 logger.info("Starting session watchdog...")
 start_watchdog()
 
-# Register signal handlers for graceful shutdown
 signal.signal(signal.SIGTERM, handle_shutdown)
 signal.signal(signal.SIGINT,  handle_shutdown)
 
