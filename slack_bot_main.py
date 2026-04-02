@@ -1518,10 +1518,33 @@ def process_message(client, req):
 # --------------------------
 # Graceful shutdown
 # --------------------------
+def force_checkout_all(reason="shutdown"):
+    if not CURRENT_MEMBERS:
+        return
+    members = load_members()
+    checkout_time = datetime.now()
+    for name in list(CURRENT_MEMBERS):
+        member = next((m for m in members.values() if m["member_name"].strip() == name), None)
+        card_uid = member["card_uid"] if member else "ABC123"
+        hours, check_in_iso = close_open_session(card_uid, name, checkout_time)
+        CURRENT_MEMBERS.discard(name)
+        SESSION_ALERTS.pop(name, None)
+        logger.info(f"Auto-checked out {name} on {reason} ({hours}h)")
+        if member:
+            try:
+                post(member["slack_id"],
+                     f"You were automatically checked out due to {reason}. "
+                     f"Hours recorded: {hours}. Contact an admin if this is incorrect.")
+            except Exception as e:
+                logger.warning(f"Could not notify {name} on {reason}: {e}")
+    try:
+        post(ANNOUNCE_CHANNEL_ID, f"Shop closed — all members checked out due to {reason}.")
+    except Exception as e:
+        logger.warning(f"Could not post shutdown announcement: {e}")
+
 def handle_shutdown(signum, frame):
     logger.info(f"Received signal {signum}. Shutting down gracefully...")
-    if CURRENT_MEMBERS:
-        logger.info(f"Members still checked in at shutdown: {', '.join(sorted(CURRENT_MEMBERS))}")
+    force_checkout_all(reason="bot shutdown")
     sys.exit(0)
 
 
@@ -1562,3 +1585,4 @@ try:
         time.sleep(1)
 except (KeyboardInterrupt, SystemExit):
     logger.info("Shutting down...")
+    force_checkout_all(reason="bot shutdown")
