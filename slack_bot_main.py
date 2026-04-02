@@ -429,8 +429,8 @@ def parse_mention(token):
     Extract slack_id from a Slack mention token like <@U07U7V298Q2> or <@U07U7V298Q2|name>.
     Returns the slack_id string, or None if not a mention.
     """
-    m = re.match(r"<@([A-Z0-9]+)(?:[|][^>]*)?>", token)
-    return m.group(1) if m else None
+    m = re.match(r"<@([A-Za-z0-9]+)(?:[|][^>]*)?>", token)
+    return m.group(1).upper() if m else None
 
 def resolve_member(token, members):
     """
@@ -1660,9 +1660,9 @@ def process_message(client, req):
         else:
             reply(event, "Unknown admin command. Available: `admin force checkout <name>`")
     elif text_lc.startswith("set my lead"):
-        handle_set_my_lead(event, slack_id, text_lc, members)
+        handle_set_my_lead(event, slack_id, text, members)
     elif text_lc.startswith("set seniority ") or text_lc.startswith("set lead "):
-        handle_set_member_field(event, slack_id, text_lc, members)
+        handle_set_member_field(event, slack_id, text, members)
     elif text_lc.startswith("approve ") or text_lc.startswith("disapprove "):
         handle_approve_disapprove(event, slack_id, text, members)
     elif text_lc == "announcement formal":
@@ -1678,7 +1678,7 @@ def process_message(client, req):
     elif text_lc == "my hours weekly":
         handle_my_hours(event, member, weekly=True)
     elif text_lc.startswith("hours report "):
-        handle_hours_report(event, slack_id, text_lc, members)
+        handle_hours_report(event, slack_id, text, members)
     elif text_lc.startswith("feedback "):
         handle_feedback(event, slack_id, text, members)
     elif "who is in" in text_lc or "who's in" in text_lc:
