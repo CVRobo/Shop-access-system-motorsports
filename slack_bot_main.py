@@ -3,6 +3,7 @@ import sys
 import csv
 import time
 import random
+import re
 import signal
 import threading
 import logging
@@ -40,7 +41,7 @@ ANNOUNCE_CHANNEL_ID = "C09MS0MFKBK"
 ADMIN_SLACK_ID      = "U07U7V298Q2"
 MEMBERS_FILE        = os.path.join(_DATA_DIR, "members.csv")
 ATTENDANCE_FILE   = os.path.join(_DATA_DIR, "attendance.csv")
-ATTENDANCE_HEADERS = ["member_name", "check_in_date", "check_in_time", "check_out_date", "check_out_time", "hours", "approved"]
+ATTENDANCE_HEADERS = ["session_id", "member_name", "check_in_date", "check_in_time", "check_out_date", "check_out_time", "hours", "approved"]
 
 
 # --------------------------
@@ -225,7 +226,15 @@ def append_session(card_uid, name, check_in_dt):
     """Append a new check-in row. Uses atomic write to avoid corruption."""
     ci_date, ci_time = dt_to_row(check_in_dt)
     rows = read_attendance_rows()
+    # session_id is global ever-incrementing — find the current max
+    max_id = 0
+    for r in rows:
+        try:
+            max_id = max(max_id, int(r.get("session_id", 0)))
+        except (ValueError, TypeError):
+            pass
     rows.append({
+        "session_id":    str(max_id + 1),
         "member_name":   name,
         "check_in_date": ci_date,
         "check_in_time": ci_time,
@@ -413,6 +422,60 @@ def write_members(members_dict):
     """Atomically write members dict back to members.csv."""
     rows = list(members_dict.values())
     _atomic_write_csv(MEMBERS_FILE, MEMBERS_HEADERS, rows)
+
+
+def parse_mention(token):
+    """
+    Extract slack_id from a Slack mention token like <@U07U7V298Q2> or <@U07U7V298Q2|name>.
+    Returns the slack_id string, or None if not a mention.
+    """
+    m = re.match(r"<@([A-Z0-9]+)(?:[|][^>]*)?>", token)
+    return m.group(1) if m else None
+
+def resolve_member(token, members):
+    """
+    Resolve a member from either a @mention token or a plain name string.
+    Returns the member dict or None.
+    token should be the raw text fragment (may include <@...>).
+    For plain names, pass the full lowercased name string.
+    """
+    slack_id = parse_mention(token)
+    if slack_id:
+        return members.get(slack_id)
+    # Plain name fallback
+    name_lc = token.strip().lower()
+    return next(
+        (m for m in members.values() if m["member_name"].strip().lower() == name_lc),
+        None
+    )
+
+def extract_mention_and_rest(text, members):
+    """
+    Given a string that may start with a @mention or a name, return
+    (member, remainder) where remainder is text after the mention/name.
+    Tries @mention first, then falls back to longest-prefix name match.
+    """
+    tokens = text.split()
+    if not tokens:
+        return None, text
+
+    # Try @mention as first token
+    if tokens[0].startswith("<@"):
+        slack_id = parse_mention(tokens[0])
+        member = members.get(slack_id) if slack_id else None
+        return member, " ".join(tokens[1:]).strip()
+
+    # Try progressively longer name prefixes
+    for end in range(len(tokens), 0, -1):
+        candidate = " ".join(tokens[:end]).lower()
+        m = next(
+            (mem for mem in members.values() if mem["member_name"].strip().lower() == candidate),
+            None
+        )
+        if m:
+            return m, " ".join(tokens[end:]).strip()
+
+    return None, text
 
 def get_seniority(member):
     """1 = most senior, 5 = most junior. Defaults to 5 on bad data."""
@@ -829,19 +892,28 @@ def handle_check_out(event, member):
 
     CURRENT_MEMBERS.discard(name)
     SESSION_ALERTS.pop(name, None)  # clear any pending watchdog alert
-    reply(event, f"Checked out at {checkout_time.strftime('%H:%M:%S')}.")
 
-    if CURRENT_MEMBERS:
-        notify_id = find_most_senior_in_shop(members, exclude_name=name)
+    # Eboard (seniority 1-2) sessions are auto-approved on checkout
+    seniority = get_seniority(member)
+    if seniority <= 2:
+        count = approve_all_sessions(name)
+        reply(event, f"Checked out at {checkout_time.strftime('%H:%M:%S')}. "
+                     f"Hours auto-approved ({hrs}h) — eboard member.")
+        logger.info(f"Auto-approved {count} session(s) for eboard member {name}")
     else:
-        notify_id = find_notify_target(check_in_iso, checkout_time, member, members)
+        reply(event, f"Checked out at {checkout_time.strftime('%H:%M:%S')}.")
 
-    if notify_id:
-        post(notify_id,
-             f"{name} checked out. Hours worked: {hrs}\n"
-             f"- `approve pending {name}` to view pending sessions\n"
-             f"- `approve {name} <number>` to approve a specific session\n"
-             f"- `disapprove {name} <number>` to remove a specific session")
+        if CURRENT_MEMBERS:
+            notify_id = find_most_senior_in_shop(members, exclude_name=name)
+        else:
+            notify_id = find_notify_target(check_in_iso, checkout_time, member, members)
+
+        if notify_id:
+            post(notify_id,
+                 f"{name} checked out. Hours worked: {hrs}\n"
+                 f"- `approve @mention` to approve all pending\n"
+                 f"- `disapprove @mention` to view sessions with IDs\n"
+                 f"- `disapprove @mention <session_id>` to disapprove a specific session")
 
     if len(CURRENT_MEMBERS) == 0:
         post(ANNOUNCE_CHANNEL_ID, f"Shop closed. Last person out: {name}")
@@ -914,67 +986,100 @@ def handle_admin_force_checkout(event, slack_id, parts, members):
 
 
 def handle_approve_disapprove(event, slack_id, text, members):
+    """
+    approve @mention / approve <n>          — approve ALL pending sessions
+    disapprove @mention / disapprove <n>    — list pending sessions with session IDs
+    disapprove @mention <id>                — disapprove a specific session by global ID
+    """
     parts = text.split()
     cmd   = parts[0].lower()
+    rest  = " ".join(parts[1:]).strip()
 
-    if len(parts) >= 3 and parts[1].lower() == "pending":
-        target_name = " ".join(parts[2:])
-        if not is_authorized_approver(slack_id, target_name, members):
-            reply(event, "You're not authorized to view pending sessions for that member.")
+    if not rest:
+        reply(event, "Usage: `approve @mention` or `disapprove @mention` or `disapprove @mention <session_id>`")
+        return
+
+    # For disapprove, check if last token is a session ID
+    trailing_id = None
+    rest_for_lookup = rest
+    if cmd == "disapprove":
+        rtokens = rest.split()
+        if rtokens and rtokens[-1].isdigit():
+            trailing_id = int(rtokens[-1])
+            rest_for_lookup = " ".join(rtokens[:-1]).strip()
+
+    target, _ = extract_mention_and_rest(rest_for_lookup, members)
+    if not target:
+        reply(event, f"Member not found: {rest_for_lookup!r}. Use a @mention or their full name.")
+        return
+
+    target_name     = target["member_name"]
+    target_slack_id = target["slack_id"]
+    approver        = members.get(slack_id)
+    approver_seniority = get_seniority(approver) if approver else 99
+
+    # Eboard (seniority 1-2) may approve their own sessions
+    is_self = slack_id == target_slack_id
+    if is_self and approver_seniority > 2:
+        reply(event, "You can't approve your own sessions.")
+        return
+    if not is_self and not is_authorized_approver(slack_id, target_name, members):
+        reply(event, "You're not authorized to approve/disapprove sessions for that member.")
+        return
+
+    # --- approve: approve all pending ---
+    if cmd == "approve":
+        count = approve_all_sessions(target_name)
+        if count:
+            reply(event, f"Approved {count} pending session(s) for {target_name}.")
+        else:
+            reply(event, f"No pending sessions to approve for {target_name}.")
+        return
+
+    # --- disapprove <id>: disapprove specific session by global session_id ---
+    if cmd == "disapprove" and trailing_id is not None:
+        rows = read_attendance_rows()
+        target_idx = None
+        for i, row in enumerate(rows):
+            try:
+                if int(row.get("session_id", -1)) == trailing_id:
+                    target_idx = i
+                    break
+            except (ValueError, TypeError):
+                pass
+        if target_idx is None:
+            reply(event, f"Session #{trailing_id} not found.")
             return
+        row = rows[target_idx]
+        if row["member_name"].strip().lower() != target_name.lower():
+            reply(event, f"Session #{trailing_id} does not belong to {target_name}.")
+            return
+        ok = delete_session(target_idx)
+        reply(event, f"Disapproved session #{trailing_id} for {target_name}." if ok else "Failed.")
+        return
+
+    # --- disapprove with no id: show list of pending sessions ---
+    if cmd == "disapprove":
         pending = get_unapproved_sessions(target_name)
         if not pending:
             reply(event, f"No pending sessions for {target_name}.")
             return
-        lines = [f"Pending sessions for {target_name}:"]
-        for i, (_, row) in enumerate(pending, start=1):
-            ci_dt = row_to_dt(row, "check_in")
-            co_dt = row_to_dt(row, "check_out")
-            ci_str = ci_dt.strftime("%Y-%m-%d %H:%M") if ci_dt else "?"
+        lines = [f"Pending sessions for *{target_name}*:"]
+        lines.append(f"{'ID':<6} {'Check-in':<18} {'Check-out':<10} {'Hours'}")
+        lines.append("-" * 46)
+        for global_idx, row in pending:
+            sid    = row.get("session_id", "?")
+            ci_dt  = row_to_dt(row, "check_in")
+            co_dt  = row_to_dt(row, "check_out")
+            ci_str = ci_dt.strftime("%b %d %H:%M") if ci_dt else "?"
             co_str = co_dt.strftime("%H:%M") if co_dt else "(open)"
-            lines.append(f"{i}. check_in: {ci_str}  check_out: {co_str}  hours: {row.get('hours') or '0.0'}")
-        lines += ["", "- `approve <name> <number>` to approve", "- `disapprove <name> <number>` to remove"]
+            hrs    = row.get("hours") or "0.0"
+            lines.append(f"#{sid:<5} {ci_str:<18} {co_str:<10} {hrs}")
+        lines.append("")
+        lines.append("To disapprove: `disapprove @mention <session_id>`")
         reply(event, "\n".join(lines))
         return
 
-    if cmd == "approve" and len(parts) >= 3 and parts[1].lower() == "all":
-        target_name = " ".join(parts[2:])
-        if not is_authorized_approver(slack_id, target_name, members):
-            reply(event, "You're not authorized to approve hours for that member.")
-            return
-        count = approve_all_sessions(target_name)
-        reply(event, f"Approved {count} session(s) for {target_name}.")
-        return
-
-    if len(parts) >= 3 and parts[-1].isdigit():
-        session_num = int(parts[-1])
-        target_name = " ".join(parts[1:-1])
-        if session_num <= 0:
-            reply(event, "Session number must be 1 or greater.")
-            return
-        if not is_authorized_approver(slack_id, target_name, members):
-            reply(event, "You're not authorized to approve/disapprove sessions for that member.")
-            return
-        pending = get_unapproved_sessions(target_name)
-        if session_num > len(pending):
-            reply(event, f"Invalid session number - {target_name} has {len(pending)} pending session(s).")
-            return
-        global_index, _ = pending[session_num - 1]
-        if cmd == "approve":
-            ok = approve_session(global_index)
-            reply(event, f"Approved session #{session_num} for {target_name}." if ok else f"Failed to approve session #{session_num}.")
-        else:
-            ok = delete_session(global_index)
-            reply(event, f"Removed session #{session_num} for {target_name}." if ok else f"Failed to remove session #{session_num}.")
-        return
-
-    reply(event, (
-        "Usage:\n"
-        "- `approve pending <name>`\n"
-        "- `approve <name> <number>`\n"
-        "- `approve all <name>`\n"
-        "- `disapprove <name> <number>`"
-    ))
 
 
 def handle_set_member_field(event, slack_id, text_lc, members):
@@ -1310,6 +1415,98 @@ def get_semester_sessions(member_name, start_date, end_date, include_disapproved
 # --------------------------
 # Hours report handlers
 # --------------------------
+def handle_my_info(event, member, members):
+    """
+    `my info` — shows name, seniority, lead, and session summary for current semester.
+    If lead is unset, prompts the member to set it themselves.
+    """
+    name      = member["member_name"]
+    seniority = get_seniority(member)
+    lead_id   = member.get("lead_slack_id", "").strip()
+
+    if lead_id:
+        lead = members.get(lead_id)
+        lead_str = lead["member_name"] if lead else f"Unknown ({lead_id})"
+    else:
+        lead_str = "Not set — use `set my lead @mention` to assign one"
+
+    sem_name, start, end = get_current_semester()
+    if sem_name:
+        all_sessions = get_semester_sessions(name, start, end, include_disapproved=True)
+        approved   = sum(1 for r in all_sessions if str(r.get("approved","")).lower() == "true")
+        pending    = sum(1 for r in all_sessions if str(r.get("approved","")).lower() in ("false","","none"))
+        total_hrs  = sum(
+            float(r.get("hours", 0))
+            for r in all_sessions
+            if str(r.get("approved","")).lower() == "true"
+        )
+        sem_label = f"{sem_name} {start.year}"
+    else:
+        approved = pending = 0
+        total_hrs = 0.0
+        sem_label = "unknown semester"
+
+    reply(event, (
+        f"*{name}*\n"
+        f"Seniority: {seniority}\n"
+        f"Lead: {lead_str}\n"
+        f"\n"
+        f"*{sem_label} summary:*\n"
+        f"Approved sessions: {approved}\n"
+        f"Pending sessions:  {pending}\n"
+        f"Total approved hours: {round(total_hrs, 2)}h"
+    ))
+
+
+def handle_set_my_lead(event, slack_id, text, members):
+    """
+    `set my lead @mention` — member sets their own lead
+    `set my lead none`     — member clears their own lead
+    """
+    rest = text.strip()
+    if not rest or rest.lower() == "set my lead":
+        reply(event, "Usage: `set my lead @mention` or `set my lead none`")
+        return
+
+    arg = rest.removeprefix("set my lead").strip()
+    me  = members.get(slack_id)
+    if not me:
+        return
+
+    if arg.lower() == "none":
+        me["lead_slack_id"] = ""
+        write_members(members)
+        reply(event, "Your lead has been cleared.")
+        return
+
+    lead, _ = extract_mention_and_rest(arg, members)
+    if not lead:
+        reply(event, f"Member not found: {arg!r}. Use a @mention or their full name.")
+        return
+    if lead["slack_id"] == slack_id:
+        reply(event, "You can't set yourself as your own lead.")
+        return
+
+    me["lead_slack_id"] = lead["slack_id"]
+    write_members(members)
+    reply(event, f"Your lead has been set to {lead['member_name']}.")
+
+
+def handle_feedback(event, slack_id, text, members):
+    """
+    `feedback <message>` — send an anonymous message to the admin.
+    The sender's identity is never included in the forwarded message.
+    """
+    msg = text.removeprefix("feedback").strip()
+    if not msg:
+        reply(event, "Usage: `feedback <your message>`")
+        return
+
+    _post_direct(ADMIN_SLACK_ID, f"📬 *Anonymous feedback:*\n{msg}")
+    reply(event, "Your feedback has been sent anonymously. Thank you.")
+    logger.info(f"Anonymous feedback received (sender identity withheld)")
+
+
 def handle_my_hours(event, member):
     """
     `my hours`
@@ -1462,6 +1659,8 @@ def process_message(client, req):
             handle_admin_force_checkout(event, slack_id, parts, members)
         else:
             reply(event, "Unknown admin command. Available: `admin force checkout <name>`")
+    elif text_lc.startswith("set my lead"):
+        handle_set_my_lead(event, slack_id, text_lc, members)
     elif text_lc.startswith("set seniority ") or text_lc.startswith("set lead "):
         handle_set_member_field(event, slack_id, text_lc, members)
     elif text_lc.startswith("approve ") or text_lc.startswith("disapprove "):
@@ -1472,29 +1671,52 @@ def process_message(client, req):
         handle_announcement_casual(event, slack_id)
     elif "is shop open" in text_lc or "is the shop open" in text_lc:
         handle_is_shop_open(event["channel"])
+    elif text_lc == "my info":
+        handle_my_info(event, member, members)
     elif text_lc == "my hours":
         handle_my_hours(event, member)
     elif text_lc == "my hours weekly":
         handle_my_hours(event, member, weekly=True)
     elif text_lc.startswith("hours report "):
         handle_hours_report(event, slack_id, text_lc, members)
+    elif text_lc.startswith("feedback "):
+        handle_feedback(event, slack_id, text, members)
     elif "who is in" in text_lc or "who's in" in text_lc:
         handle_who_is_in(event)
     else:
         reply(event, (
             "Available commands:\n"
+            "\n"
+            "*Attendance*\n"
             "- `check in` / `check out`\n"
+            "\n"
+            "*Shop status*\n"
             "- `who is in` / `is shop open`\n"
-            "- `my hours` / `my hours weekly`\n"
-            "- `hours report <name>` (seniors/leads only)\n"
-            "- `approve pending <name>`\n"
-            "- `approve <name> <number>`\n"
-            "- `approve all <name>`\n"
-            "- `disapprove <name> <number>`\n"
-            "- `announcement formal` / `announcement casual` (admin only)\n"
-            "- `admin force checkout <name>` (seniority-1 / admin only)"
+            "\n"
+            "*Hours*\n"
+            "- `my hours` — semester summary\n"
+            "- `my hours weekly` — this week\n"
+            "- `my info` — your profile, lead, and session counts\n"
+            "\n"
+            "*Approvals* (seniors/leads only)\n"
+            "- `approve @mention` — approve all pending sessions\n"
+            "- `disapprove @mention` — list pending sessions with IDs\n"
+            "- `disapprove @mention <session_id>` — disapprove a specific session\n"
+            "- `hours report @mention` — full semester report\n"
+            "- `hours report weekly @mention` — this week's report\n"
+            "\n"
+            "*Settings*\n"
+            "- `set my lead @mention` / `set my lead none`\n"
+            "\n"
+            "*Admin / Seniority-1*\n"
+            "- `admin force checkout @mention`\n"
+            "- `set seniority @mention <1-5>`\n"
+            "- `set lead @mention @lead` / `set lead @mention none`\n"
+            "- `announcement formal` / `announcement casual`\n"
+            "\n"
+            "*Other*\n"
+            "- `feedback <message>` — send anonymous feedback to admin"
         ))
-
 
 # --------------------------
 # Graceful shutdown
