@@ -666,7 +666,7 @@ def is_authorized_approver(approver_id, target_name, members):
     )
     if not target:
         return False
-    is_more_senior = get_seniority(approver) < get_seniority(target)
+    is_more_senior = (get_seniority(approver) < get_seniority(target)) or get_seniority(approver)>=2
     is_lead = target.get("lead_slack_id", "").strip() == approver_id
     return is_more_senior or is_lead
 
@@ -1048,8 +1048,10 @@ def handle_register(event, slack_id, text, members):
     This is useful when the Slack display name is a username/handle rather
     than a real name.
     """
-    if slack_id != ADMIN_SLACK_ID:
-        reply(event, "You're not authorized. Only the admin can register new members.")
+    approver = members.get(slack_id)
+    is_authorized = slack_id == ADMIN_SLACK_ID or (approver and get_seniority(approver) <= 2)
+    if not is_authorized:
+        reply(event, "You're not authorized. Only seniority-1/2 members or the admin can register new members.")
         return
 
     parts = text.split(None, 1)          # ["register", "<rest>"]
