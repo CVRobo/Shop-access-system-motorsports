@@ -1037,6 +1037,102 @@ def handle_set_member_field(event, slack_id, text, members):
 
     reply(event, "Unknown subcommand. Use `set seniority` or `set lead`.")
 
+def handle_register(event, slack_id, text, members):
+    """
+    `register @mention [name override]`
+    Admin-only. Looks up the user's Slack display name, creates a member
+    entry with seniority 5, no lead, and a placeholder card_uid.
+
+    Optionally a plain-text name override can follow the mention:
+      register @mention John Smith
+    This is useful when the Slack display name is a username/handle rather
+    than a real name.
+    """
+    if slack_id != ADMIN_SLACK_ID:
+        reply(event, "You're not authorized. Only the admin can register new members.")
+        return
+
+    parts = text.split(None, 1)          # ["register", "<rest>"]
+    if len(parts) < 2 or not parts[1].strip():
+        reply(event, "Usage: `register @mention` or `register @mention Full Name`")
+        return
+
+    rest = parts[1].strip()
+    rest_tokens = rest.split()
+
+    # First token must be a @mention
+    new_slack_id = parse_mention(rest_tokens[0])
+    if not new_slack_id:
+        reply(event, "Please provide a @mention as the first argument.\nUsage: `register @mention`")
+        return
+
+    # Optional name override supplied after the mention
+    name_override = " ".join(rest_tokens[1:]).strip() if len(rest_tokens) > 1 else ""
+
+    # Duplicate check
+    if new_slack_id in members:
+        existing = members[new_slack_id]
+        reply(event, f"{existing['member_name']} is already registered (slack_id: {new_slack_id}).")
+        return
+
+    # Resolve display name from Slack
+    if name_override:
+        display_name = name_override
+    else:
+        try:
+            info = web_client.users_info(user=new_slack_id)
+            profile = info["user"]["profile"]
+            # Prefer real_name, fall back to display_name, then username
+            display_name = (
+                profile.get("real_name", "").strip()
+                or profile.get("display_name", "").strip()
+                or info["user"].get("name", new_slack_id)
+            )
+        except SlackApiError as e:
+            logger.error(f"Could not fetch Slack profile for {new_slack_id}: {e}")
+            reply(event, f"Could not look up Slack profile for <@{new_slack_id}>. "
+                         f"Try: `register @mention Full Name` to set the name manually.")
+            return
+
+    if not display_name:
+        reply(event, f"Could not determine a display name for <@{new_slack_id}>. "
+                     f"Use: `register @mention Full Name`")
+        return
+
+    # Generate a placeholder card_uid (8 hex chars, guaranteed unique within the file)
+    import secrets
+    existing_uids = {m.get("card_uid", "").upper() for m in members.values()}
+    while True:
+        card_uid = secrets.token_hex(4).upper()   # e.g. "A3F2C109"
+        if card_uid not in existing_uids:
+            break
+
+    new_member = {
+        "card_uid":      card_uid,
+        "member_name":   display_name,
+        "slack_id":      new_slack_id,
+        "seniority":     "5",
+        "lead_slack_id": "",
+    }
+    members[new_slack_id] = new_member
+    write_members(members)
+
+    logger.info(f"Admin registered new member: {display_name} ({new_slack_id}), card_uid={card_uid}")
+    reply(event, (
+        f" Registered *{display_name}* (<@{new_slack_id}>)\n"
+        f"• Seniority: 5 (lowest by default)\n"
+        # f"• Card UID: `{card_uid}` (placeholder, update if they have a physical card)\n"
+        f"• Lead: not set\n\n"
+        f"To update: `set seniority @mention <1-5>` · `set lead @mention @lead`"
+    ))
+    # Notify the new member
+    try:
+        post(new_slack_id,
+             f"You've been registered in the shop attendance system by an admin. "
+             f"You can now use `check in` / `check out` here in DMs.\n"
+             f"To set your lead: `set my lead @mention`")
+    except SlackApiError as e:
+        logger.warning(f"Could not DM new member {new_slack_id}: {e}")
 
 def handle_announcement_formal(event, slack_id):
     global USE_FORMAL_MODE
@@ -1481,6 +1577,8 @@ def process_message(client, req):
         handle_feedback(event, slack_id, text, members)
     elif "who is in" in text_lc or "who's in" in text_lc:
         handle_who_is_in(event)
+    elif text_lc.startswith("register "):
+        handle_register(event, slack_id, text, members)
     else:
         reply(event, (
             "Available commands:\n"
@@ -1510,6 +1608,7 @@ def process_message(client, req):
             "- `set seniority @mention <1-5>`\n"
             "- `set lead @mention @lead` / `set lead @mention none`\n"
             "- `announcement formal` / `announcement casual`\n"
+            "- `register @mention [Full Name]`, add a new member\n"
             "\n"
             "*Other*\n"
             "- `feedback <message>` — send anonymous feedback to admin"
