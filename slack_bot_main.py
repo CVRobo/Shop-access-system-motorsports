@@ -183,7 +183,7 @@ def row_to_dt(row, prefix):
     except (ValueError, TypeError):
         return None
 
-def append_session(card_uid, name, check_in_dt):
+def append_session(name, check_in_dt):
     ci_date, ci_time = dt_to_row(check_in_dt)
     rows = read_attendance_rows()
     max_id = 0
@@ -211,7 +211,7 @@ def get_open_session(member_name):
             return row
     return None
 
-def close_open_session(card_uid, member_name, checkout_dt):
+def close_open_session(member_name, checkout_dt):
     rows = read_attendance_rows()
     target = None
     for i in range(len(rows) - 1, -1, -1):
@@ -482,9 +482,8 @@ def find_notify_target(check_in_iso, checkout_dt, checking_out_member, members):
 def _auto_checkout_member(name, members):
     checkout_time = datetime.now()
     member = next((m for m in members.values() if m["member_name"].strip() == name), None)
-    card_uid = member["card_uid"] if member else "ABC123"
 
-    hours, check_in_iso = close_open_session(card_uid, name, checkout_time)
+    hours, check_in_iso = close_open_session(name, checkout_time)
     CURRENT_MEMBERS.discard(name)
     SESSION_ALERTS.pop(name, None)
     logger.info(f"Watchdog auto-checked out {name} after no response ({hours}h)")
@@ -666,7 +665,7 @@ def is_authorized_approver(approver_id, target_name, members):
     )
     if not target:
         return False
-    is_more_senior = (get_seniority(approver) < get_seniority(target)) or get_seniority(approver)>=2
+    is_more_senior = get_seniority(approver) < get_seniority(target)
     is_lead = target.get("lead_slack_id", "").strip() == approver_id
     return is_more_senior or is_lead
 
@@ -674,10 +673,9 @@ def is_authorized_approver(approver_id, target_name, members):
 # Command handlers
 # --------------------------
 def handle_check_in(event, member):
-    name     = member["member_name"]
-    card_uid = member["card_uid"]
+    name = member["member_name"]
 
-    existing = get_open_session(card_uid)
+    existing = get_open_session(name)
     if existing or name in CURRENT_MEMBERS:
         if existing:
             try:
@@ -694,7 +692,7 @@ def handle_check_in(event, member):
     check_in_time = datetime.now()
 
     try:
-        append_session(card_uid, name, check_in_time)
+        append_session(name, check_in_time)
         CURRENT_MEMBERS.add(name)
         SESSION_ALERTS.pop(name, None)
         logger.info(f"{name} checked in at {check_in_time.isoformat()}")
@@ -712,11 +710,10 @@ def handle_check_in(event, member):
 
 def handle_check_out(event, member):
     name          = member["member_name"]
-    card_uid      = member["card_uid"]
     checkout_time = datetime.now()
     members       = load_members()
 
-    hours, check_in_iso = close_open_session(card_uid, name, checkout_time)
+    hours, check_in_iso = close_open_session(name, checkout_time)
 
     if hours is None:
         if name in CURRENT_MEMBERS:
@@ -870,7 +867,7 @@ def handle_approve_disapprove(event, slack_id, text, members):
 
     is_self = slack_id == target_slack_id
     if is_self and approver_seniority > 2:
-        reply(event, "You can't approve your own sessions.")
+        reply(event, f"You can't {cmd} your own sessions.")
         return
     if not is_self and not is_authorized_approver(slack_id, target_name, members):
         reply(event, "You're not authorized to approve/disapprove sessions for that member.")
@@ -1121,7 +1118,7 @@ def handle_register(event, slack_id, text, members):
 
     logger.info(f"Admin registered new member: {display_name} ({new_slack_id}), card_uid={card_uid}")
     reply(event, (
-        f" Registered *{display_name}* (<@{new_slack_id}>)\n"
+        f"✅ Registered *{display_name}* (<@{new_slack_id}>)\n"
         f"• Seniority: 5 (lowest by default)\n"
         # f"• Card UID: `{card_uid}` (placeholder, update if they have a physical card)\n"
         f"• Lead: not set\n\n"
@@ -1241,8 +1238,9 @@ def format_hours_report(sessions, include_disapproved=False):
     lines          = []
     total_approved = 0.0
     total_pending  = 0.0
+    i              = 0
 
-    for i, row in enumerate(sessions, start=1):
+    for row in sessions:
         approved = str(row.get("approved", "")).strip().lower()
 
         if approved in ("false", ""):
@@ -1279,6 +1277,7 @@ def format_hours_report(sessions, include_disapproved=False):
         except (ValueError, TypeError):
             hrs = "?h"
 
+        i += 1
         lines.append(f"{i}. {ci} – {co}  |  {hrs}  |  {status}")
 
     return "\n".join(lines), round(total_approved, 2), round(total_pending, 2)
@@ -1348,13 +1347,15 @@ def handle_my_info(event, member, members):
 
 
 def handle_set_my_lead(event, slack_id, text, members):
-    rest = text.strip()
-    if not rest or rest.lower() == "set my lead":
+    # Strip the command prefix case-insensitively (dispatcher matched on text_lc,
+    # so `text` itself may not start with a lowercase "set my lead").
+    prefix = "set my lead"
+    arg = text.strip()[len(prefix):].strip() if text.lower().strip().startswith(prefix) else ""
+    if not arg:
         reply(event, "Usage: `set my lead @mention` or `set my lead none`")
         return
 
-    arg = rest.removeprefix("set my lead").strip()
-    me  = members.get(slack_id)
+    me = members.get(slack_id)
     if not me:
         return
 
@@ -1378,7 +1379,8 @@ def handle_set_my_lead(event, slack_id, text, members):
 
 
 def handle_feedback(event, slack_id, text, members):
-    msg = text.removeprefix("feedback").strip()
+    prefix = "feedback"
+    msg = text.strip()[len(prefix):].strip() if text.lower().strip().startswith(prefix) else text.strip()
     if not msg:
         reply(event, "Usage: `feedback <your message>`")
         return
@@ -1626,8 +1628,7 @@ def force_checkout_all(reason="shutdown"):
     checkout_time = datetime.now()
     for name in list(CURRENT_MEMBERS):
         member = next((m for m in members.values() if m["member_name"].strip() == name), None)
-        card_uid = member["card_uid"] if member else "ABC123"
-        hours, check_in_iso = close_open_session(card_uid, name, checkout_time)
+        hours, check_in_iso = close_open_session(name, checkout_time)
         CURRENT_MEMBERS.discard(name)
         SESSION_ALERTS.pop(name, None)
         logger.info(f"Auto-checked out {name} on {reason} ({hours}h)")
