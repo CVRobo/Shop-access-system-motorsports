@@ -55,8 +55,8 @@ SEMESTER_STATE_HEADERS = ["semester_name", "start_date", "restarted_by", "restar
 # --------------------------
 OFFICE_HOURS_FILE = os.path.join(_DATA_DIR, "office_hours.csv")
 # Seniority is 1 (most senior/trusted) through 5 (newest, default for new registrants).
-# "Seniority 3 or above" is interpreted here as rank <= 3 -- i.e. everyone except the
-# two newest tiers (4, 5). If that's backwards from what you meant, flip this to >=.
+# "Seniority 3 or above" is interpreted here as rank <= 3 i.e. everyone except the
+# two newest tiers (4, 5).
 OFFICE_HOURS_MAX_SENIORITY_LEVEL = 3
 
 # --------------------------
@@ -1618,7 +1618,7 @@ def handle_register(event, slack_id, text, members):
 
     logger.info(f"Admin registered new member: {display_name} ({new_slack_id}), card_uid={card_uid}")
     reply(event, (
-        f"✅ Registered *{display_name}* (<@{new_slack_id}>)\n"
+        f" Registered *{display_name}* (<@{new_slack_id}>)\n"
         f"• Seniority: 5 (lowest by default)\n"
         # f"• Card UID: `{card_uid}` (placeholder, update if they have a physical card)\n"
         f"• Lead: not set\n\n"
@@ -1812,8 +1812,8 @@ def handle_confirm_semester_restart(event, slack_id, members):
     who = member["member_name"] if member else slack_id
     set_semester_state(label, who, start_date=start_date)
     logger.warning(f"Semester restarted by {who} ({slack_id}): {label}, starting {start_date}")
-    reply(event, f"✅ New semester started: *{label}*, beginning {start_date.strftime('%b %d, %Y')}.")
-    post(ANNOUNCE_CHANNEL_ID, f"📚 New semester started: *{label}*. Hours tracking has reset for the new term.")
+    reply(event, f"New semester started: *{label}*, beginning {start_date.strftime('%b %d, %Y')}.")
+    post(ANNOUNCE_CHANNEL_ID, f"New semester started: *{label}*. Hours tracking has reset for the new term.")
 
 
 def handle_admin_add(event, slack_id, text, members):
@@ -1836,7 +1836,7 @@ def handle_admin_add(event, slack_id, text, members):
     added_by = approver["member_name"] if approver else slack_id
     add_admin_record(target["slack_id"], target["member_name"], added_by)
     logger.warning(f"{added_by} added {target['member_name']} ({target['slack_id']}) as an admin.")
-    reply(event, f"✅ {target['member_name']} is now an admin.")
+    reply(event, f" {target['member_name']} is now an admin.")
     try:
         post(target["slack_id"], f"You've been made an admin of the shop bot by {added_by}. "
                                    f"Send `help` to see the full command list, including admin commands.")
@@ -1966,12 +1966,12 @@ def handle_admin_log(event, slack_id, text, members):
 
 def handle_about(event):
     reply(event, (
-        "🤖 *Shop Attendance Bot*\n\n"
+        " *Shop Attendance Bot*\n\n"
         "I track check-ins and check-outs for the shop, keep hours per semester, "
         "handle approvals, and cover a few admin and office-hours-scheduling tasks "
         "behind the scenes.\n\n"
         "Send `help` any time to see everything I can do.\n\n"
-        "Built and maintained by Kushagra Taneja. Found a bug or have a suggestion? "
+        "Built and maintained by Kushagra Taneja (Kush). Found a bug or have a suggestion? "
         "DM him directly on Slack, or use `feedback <message>` to send it anonymously."
     ))
 
@@ -2250,7 +2250,7 @@ def handle_feedback(event, slack_id, text, members):
     if not msg:
         reply(event, "Usage: `feedback <your message>`")
         return
-    notify_all_admins(f"📬 *Anonymous feedback:*\n{msg}")
+    notify_all_admins(f" *Anonymous feedback:*\n{msg}")
     reply(event, "Your feedback has been sent anonymously. Thank you.")
     logger.info("Anonymous feedback received (sender identity withheld)")
 
@@ -2481,7 +2481,7 @@ def _dispatch_message(event):
         if slack_id in SESSION_ALERTS:
             ok = confirm_session(slack_id, slack_id, members)
             if ok:
-                reply(event, "Got it — you're all set until the 8-hour mark, at which point "
+                reply(event, "Got it, you're all set until the 8-hour mark, at which point "
                              "you'll be automatically checked out.")
             else:
                 reply(event, "That confirmation has expired (you're past the 8-hour mark) — "
@@ -2501,7 +2501,7 @@ def _dispatch_message(event):
             else:
                 reply(event, f"That confirmation for {target_name} has expired.")
             return
-        return  # spurious "y" — ignore silently
+        return  # spurious "y" - ignore silently
 
     if "check in" in text_lc:
         handle_check_in(event, member)
