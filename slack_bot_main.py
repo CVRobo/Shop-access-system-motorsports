@@ -31,7 +31,7 @@ load_dotenv(os.path.join(_ASSET_DIR, ".env"))
 
 SLACK_BOT_TOKEN     = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN     = os.getenv("SLACK_APP_TOKEN")
-ANNOUNCE_CHANNEL_ID = "C09MS0MFKBK"
+ANNOUNCE_CHANNEL_ID = "C06CT1ZTYUS"
 ADMIN_SLACK_ID      = "U07U7V298Q2"   # bootstrap/root admin - always authorized, can't be removed
 MEMBERS_FILE        = os.path.join(_DATA_DIR, "members.csv")
 ATTENDANCE_FILE     = os.path.join(_DATA_DIR, "attendance.csv")
