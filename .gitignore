@@ -3,3 +3,5 @@ __pycache__
 attendance.csv
 .DS_Store
 bot.log
+admins.csv
+office_hours.csv

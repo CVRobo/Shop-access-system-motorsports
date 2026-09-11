@@ -32,7 +32,7 @@ load_dotenv(os.path.join(_ASSET_DIR, ".env"))
 SLACK_BOT_TOKEN     = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN     = os.getenv("SLACK_APP_TOKEN")
 ANNOUNCE_CHANNEL_ID = "C09MS0MFKBK"
-ADMIN_SLACK_ID      = "U07U7V298Q2"   # bootstrap/root admin — always authorized, can't be removed
+ADMIN_SLACK_ID      = "U07U7V298Q2"   # bootstrap/root admin - always authorized, can't be removed
 MEMBERS_FILE        = os.path.join(_DATA_DIR, "members.csv")
 ATTENDANCE_FILE     = os.path.join(_DATA_DIR, "attendance.csv")
 ATTENDANCE_HEADERS  = ["session_id", "member_name", "slack_id", "check_in_date", "check_in_time",
@@ -55,9 +55,13 @@ SEMESTER_STATE_HEADERS = ["semester_name", "start_date", "restarted_by", "restar
 # --------------------------
 OFFICE_HOURS_FILE = os.path.join(_DATA_DIR, "office_hours.csv")
 # Seniority is 1 (most senior/trusted) through 5 (newest, default for new registrants).
-# "Seniority 3 or above" is interpreted here as rank <= 3 i.e. everyone except the
-# two newest tiers (4, 5).
+# "Seniority 3 or above" is interpreted here as rank <= 3 -- i.e. everyone except the
+# two newest tiers (4, 5). If that's backwards from what you meant, flip this to >=.
 OFFICE_HOURS_MAX_SENIORITY_LEVEL = 3
+
+# Night-before heads-up for tomorrow's scheduled office hours (24h "HH:MM", local time)
+OFFICE_HOURS_DAY_BEFORE_REMINDER_TIME = "20:00"
+OFFICE_HOURS_DAY_BEFORE_REMINDED = set()   # {(slack_id, block_id, "YYYY-MM-DD")} -- date of the upcoming shift
 
 # --------------------------
 # Pending admin confirmations (shutdown / semester restart)
@@ -384,15 +388,15 @@ def rebuild_current_members():
         if not row_slack_id:
             # Can't safely restore live presence state without knowing who this is
             # (e.g. the member was removed from members.csv while still checked in).
-            stale.append((f"{name} (unresolved member — not in members.csv)", ci_label, round(age_hours, 1)))
-            logger.warning(f"Open session for '{name}' has no resolvable member — NOT restoring, needs manual review.")
+            stale.append((f"{name} (unresolved member - not in members.csv)", ci_label, round(age_hours, 1)))
+            logger.warning(f"Open session for '{name}' has no resolvable member - NOT restoring, needs manual review.")
             continue
 
         if age_hours > STALE_SESSION_HOURS:
             stale.append((name, ci_label, round(age_hours, 1)))
             logger.warning(
                 f"Stale open session found for {name} (checked in {ci_label}, "
-                f"{round(age_hours, 1)}h ago) — NOT restoring to CURRENT_MEMBERS."
+                f"{round(age_hours, 1)}h ago) - NOT restoring to CURRENT_MEMBERS."
             )
         else:
             CURRENT_MEMBERS.add(row_slack_id)
@@ -407,7 +411,7 @@ def rebuild_current_members():
             f"- {name} (checked in {ci}, {age}h ago)" for name, ci, age in stale
         )
         msg = (
-            f"⚠️ Bot restarted and found {len(stale)} stale/unresolved open session(s):\n"
+            f"Bot restarted and found {len(stale)} stale/unresolved open session(s):\n"
             f"{stale_lines}\n\n"
             f"To close a session manually, use: `admin force checkout <name>`"
         )
@@ -504,7 +508,7 @@ def get_seniority(member):
         return val
     except (ValueError, TypeError):
         logger.warning(f"Invalid seniority value for {member.get('member_name', '?')}: "
-                       f"'{member.get('seniority')}' — defaulting to 5")
+                       f"'{member.get('seniority')}' - defaulting to 5")
         return 5
 
 # --------------------------
@@ -597,7 +601,7 @@ def find_notify_target(check_in_iso, checkout_dt, checking_out_member, members):
     try:
         session_start = datetime.fromisoformat(check_in_iso)
     except (ValueError, TypeError):
-        logger.warning(f"Could not parse check_in '{check_in_iso}' for {exclude_name} — falling back to lead/admin.")
+        logger.warning(f"Could not parse check_in '{check_in_iso}' for {exclude_name} - falling back to lead/admin.")
         return lead_id or ADMIN_SLACK_ID
 
     window_start = checkout_dt - timedelta(hours=24)
@@ -634,10 +638,10 @@ def find_notify_target(check_in_iso, checkout_dt, checking_out_member, members):
         return best["slack_id"]
 
     if lead_id:
-        logger.info(f"{exclude_name} was alone — notifying lead {lead_id}")
+        logger.info(f"{exclude_name} was alone - notifying lead {lead_id}")
         return lead_id
 
-    logger.warning(f"No lead set for {exclude_name} — falling back to admin")
+    logger.warning(f"No lead set for {exclude_name} - falling back to admin")
     return ADMIN_SLACK_ID
 
 # --------------------------
@@ -666,7 +670,7 @@ def _auto_checkout_member(slack_id, members, reason="no_response"):
         if reason == "max_hours":
             post(member["slack_id"],
                  f"You've been automatically checked out after reaching the {SESSION_AUTO_CHECKOUT_HOURS}-hour mark "
-                 f"— we don't expect anyone to work a single shift longer than that. "
+                 f"- we don't expect anyone to work a single shift longer than that. "
                  f"Hours recorded: {hrs}. Please `check in` again if you're still working.")
         else:
             post(member["slack_id"],
@@ -736,6 +740,7 @@ def _prune_old_backups():
 def _watchdog_tick():
     _maybe_backup_data()
     _check_office_hours_reminders()
+    _check_office_hours_day_before_reminders()
     if not CURRENT_MEMBERS:
         return
     members = load_members()
@@ -762,14 +767,14 @@ def _watchdog_tick():
         # Hard cap: fires regardless of confirmation stage, even if they replied
         # "y" earlier. Nobody is expected to work a single shift longer than this.
         if elapsed_h >= SESSION_AUTO_CHECKOUT_HOURS:
-            logger.info(f"Watchdog: {name} reached {SESSION_AUTO_CHECKOUT_HOURS}h hard limit — auto-checking out.")
+            logger.info(f"Watchdog: {name} reached {SESSION_AUTO_CHECKOUT_HOURS}h hard limit - auto-checking out.")
             if alert and alert.get("senior_slack_id"):
                 SENIOR_PENDING.pop(alert["senior_slack_id"], None)
             _auto_checkout_member(slack_id, members, reason="max_hours")
             continue
 
         if alert is None and elapsed_h >= SESSION_CHECK_HOURS:
-            logger.info(f"Watchdog: {name} has been in {elapsed_h:.1f}h — sending check-in ping.")
+            logger.info(f"Watchdog: {name} has been in {elapsed_h:.1f}h - sending check-in ping.")
             SESSION_ALERTS[slack_id] = {
                 "stage":           "awaiting_member",
                 "alert_sent_at":   now,
@@ -793,19 +798,19 @@ def _watchdog_tick():
         if alert["stage"] == "awaiting_member" and alert_age_min >= SESSION_RESPONSE_MINUTES:
             senior_slack_id = find_most_senior_in_shop(members, exclude_slack_id=slack_id)
             if senior_slack_id:
-                logger.info(f"Watchdog: {name} did not respond — escalating to senior {senior_slack_id}.")
+                logger.info(f"Watchdog: {name} did not respond - escalating to senior {senior_slack_id}.")
                 alert["stage"]           = "awaiting_senior"
                 alert["alert_sent_at"]   = now
                 alert["senior_slack_id"] = senior_slack_id
                 SENIOR_PENDING[senior_slack_id] = slack_id
                 _send_senior_alert(senior_slack_id, name, elapsed_h)
             else:
-                logger.info(f"Watchdog: {name} did not respond and is alone — auto-checking out.")
+                logger.info(f"Watchdog: {name} did not respond and is alone - auto-checking out.")
                 _auto_checkout_member(slack_id, members, reason="no_response")
             continue
 
         if alert["stage"] == "awaiting_senior" and alert_age_min >= SESSION_RESPONSE_MINUTES:
-            logger.info(f"Watchdog: Senior did not respond for {name} — auto-checking out.")
+            logger.info(f"Watchdog: Senior did not respond for {name} - auto-checking out.")
             if alert.get("senior_slack_id"):
                 SENIOR_PENDING.pop(alert["senior_slack_id"], None)
             _auto_checkout_member(slack_id, members, reason="no_response")
@@ -873,8 +878,32 @@ def _check_office_hours_reminders():
         OFFICE_HOURS_REMINDED.add(key)
         post(b["slack_id"],
              f"You're scheduled for office hours right now "
-             f"({office_hours.format_time_12h(b['start_time'])}–{office_hours.format_time_12h(b['end_time'])}) "
+             f"({office_hours.format_time_12h(b['start_time'])}-{office_hours.format_time_12h(b['end_time'])}) "
              f"but haven't checked in yet. Send `check in` when you arrive.")
+
+def _check_office_hours_day_before_reminders():
+    """Sends a one-time heads-up the evening before someone's scheduled office
+    hours (default 8 PM local time, see OFFICE_HOURS_DAY_BEFORE_REMINDER_TIME).
+    De-duped per (person, block, upcoming date)."""
+    global OFFICE_HOURS_DAY_BEFORE_REMINDED
+    now = datetime.now()
+    if now.strftime("%H:%M") < OFFICE_HOURS_DAY_BEFORE_REMINDER_TIME:
+        return
+
+    tomorrow = now.date() + timedelta(days=1)
+    tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+    OFFICE_HOURS_DAY_BEFORE_REMINDED = {k for k in OFFICE_HOURS_DAY_BEFORE_REMINDED if k[2] == tomorrow_str}
+
+    blocks = office_hours.list_for_day(OFFICE_HOURS_FILE, tomorrow.weekday())
+    for b in blocks:
+        key = (b["slack_id"], b["id"], tomorrow_str)
+        if key in OFFICE_HOURS_DAY_BEFORE_REMINDED:
+            continue
+        OFFICE_HOURS_DAY_BEFORE_REMINDED.add(key)
+        post(b["slack_id"],
+             f"Reminder: you're scheduled for office hours tomorrow "
+             f"({office_hours.DAY_NAMES[tomorrow.weekday()]}, "
+             f"{office_hours.format_time_12h(b['start_time'])}-{office_hours.format_time_12h(b['end_time'])}).")
 
 # --------------------------
 # Slack posting helpers
@@ -956,8 +985,8 @@ def handle_office_hours(event, slack_id, text, members):
         lines = [f"Office hours for *{target['member_name']}*:"]
         for b in blocks:
             day_name = office_hours.DAY_NAMES[int(b["day"])]
-            lines.append(f"#{b['id']} — {day_name} "
-                         f"{office_hours.format_time_12h(b['start_time'])}–{office_hours.format_time_12h(b['end_time'])}")
+            lines.append(f"#{b['id']} - {day_name} "
+                         f"{office_hours.format_time_12h(b['start_time'])}-{office_hours.format_time_12h(b['end_time'])}")
         reply(event, "\n".join(lines))
         return
 
@@ -983,18 +1012,18 @@ def handle_office_hours(event, slack_id, text, members):
         time_range = office_hours.parse_time_range(set_parts[1])
         if time_range is None:
             reply(event, "Couldn't understand that time range. Use e.g. `3pm-5pm`, `3:00pm-5:30pm`, "
-                         "or 24h `15:00-17:30`. (Bare hours like `3-5` are ambiguous — include am/pm.)")
+                         "or 24h `15:00-17:30`. (Bare hours like `3-5` are ambiguous - include am/pm.)")
             return
         start, end = time_range
         new_row, conflict = office_hours.add_block(OFFICE_HOURS_FILE, member["member_name"], slack_id, day, start, end)
         day_name = office_hours.DAY_NAMES[day]
         if conflict:
             reply(event, f"That overlaps your existing {day_name} slot "
-                         f"{office_hours.format_time_12h(conflict['start_time'])}–{office_hours.format_time_12h(conflict['end_time'])} "
+                         f"{office_hours.format_time_12h(conflict['start_time'])}-{office_hours.format_time_12h(conflict['end_time'])} "
                          f"(#{conflict['id']}). Cancel it first if you want to replace it.")
             return
         reply(event, f"✅ Office hours set: every *{day_name}*, "
-                      f"{office_hours.format_time_12h(start)}–{office_hours.format_time_12h(end)} (#{new_row['id']}).")
+                      f"{office_hours.format_time_12h(start)}-{office_hours.format_time_12h(end)} (#{new_row['id']}).")
         logger.info(f"{member['member_name']} set office hours: {day_name} {start}-{end}")
         return
 
@@ -1014,7 +1043,7 @@ def handle_office_hours(event, slack_id, text, members):
             reply(event, f"Cleared {count} office hours slot(s)." if count else "No office hours scheduled.")
             return
         if not arg.isdigit():
-            reply(event, "Usage: `office hours cancel <id>` — see IDs with `office hours list`.")
+            reply(event, "Usage: `office hours cancel <id>` - see IDs with `office hours list`.")
             return
         removed = office_hours.remove_block(OFFICE_HOURS_FILE, int(arg), slack_id=target_slack_id)
         if not removed:
@@ -1022,15 +1051,15 @@ def handle_office_hours(event, slack_id, text, members):
             return
         day_name = office_hours.DAY_NAMES[int(removed["day"])]
         reply(event, f"Cancelled #{arg} ({day_name} "
-                     f"{office_hours.format_time_12h(removed['start_time'])}–{office_hours.format_time_12h(removed['end_time'])}).")
+                     f"{office_hours.format_time_12h(removed['start_time'])}-{office_hours.format_time_12h(removed['end_time'])}).")
         return
 
     reply(event, (
         "Office hours commands:\n"
-        "- `office hours set <day> <start>-<end>` — e.g. `office hours set Tue 3pm-5pm`\n"
+        "- `office hours set <day> <start>-<end>` - e.g. `office hours set Tue 3pm-5pm`\n"
         "- `office hours cancel <id>` / `office hours cancel all`\n"
         "- `office hours list` / `office hours list @mention`\n"
-        "- `office hours today` — who's scheduled today"
+        "- `office hours today` - who's scheduled today"
     ))
 
 
@@ -1085,7 +1114,7 @@ def handle_check_out(event, member):
     if hours is None:
         if slack_id in CURRENT_MEMBERS:
             CURRENT_MEMBERS.discard(slack_id)
-            logger.warning(f"{name} was in CURRENT_MEMBERS but had no open CSV session — cleared.")
+            logger.warning(f"{name} was in CURRENT_MEMBERS but had no open CSV session - cleared.")
             reply(event, "Inconsistency detected: you were marked as checked in but no CSV session was found. "
                          "Your live state has been cleared - please check in again.")
         else:
@@ -1105,7 +1134,7 @@ def handle_check_out(event, member):
     if seniority <= 2:
         count = approve_all_sessions(slack_id, name)
         reply(event, f"Checked out at {checkout_time.strftime('%H:%M:%S')}. "
-                     f"Hours auto-approved ({hrs}h) — eboard member.")
+                     f"Hours auto-approved ({hrs}h) - eboard member.")
         logger.info(f"Auto-approved {count} session(s) for eboard member {name}")
     else:
         reply(event, f"Checked out at {checkout_time.strftime('%H:%M:%S')}.")
@@ -1172,7 +1201,7 @@ def handle_admin_force_checkout(event, slack_id, parts, members):
         # checked out first). The CSV row is still closed above, but we can't
         # safely touch live presence state without a slack_id to key it by.
         logger.warning(f"Force-closed a session for '{target_name}', who isn't a currently registered "
-                        f"member — couldn't clean up in-memory shop-presence state for them.")
+                        f"member - couldn't clean up in-memory shop-presence state for them.")
 
     logger.info(f"Admin force-closed session for {target_name} ({hours}h)")
     reply(event, f"Force closed session for {target_name}. Hours recorded: {hours}")
@@ -1183,9 +1212,9 @@ def handle_admin_force_checkout(event, slack_id, parts, members):
 
 def handle_approve_disapprove(event, slack_id, text, members):
     """
-    approve @mention / approve <name>           — approve ALL pending sessions
-    disapprove @mention / disapprove <name>     — list pending sessions with session IDs
-    disapprove @mention <id>                    — disapprove a specific session by global ID
+    approve @mention / approve <name>           - approve ALL pending sessions
+    disapprove @mention / disapprove <name>     - list pending sessions with session IDs
+    disapprove @mention <id>                    - disapprove a specific session by global ID
     """
     parts = text.split()
     cmd   = parts[0].lower()
@@ -1285,6 +1314,7 @@ SENIORITY_CAPABILITIES = {
         "Set your own lead (`set my lead @mention`)",
         "Check who's in and whether the shop is open (`who is in`, `is shop open`)",
         "View office hours schedules (`office hours list`, `office hours today`)",
+        "Check the hours leaderboard (`top hours`)",
         "Send anonymous feedback to the admins (`feedback <message>`)",
     ],
     4: [
@@ -1378,7 +1408,7 @@ def handle_add_session(event, slack_id, text, members):
     time_range = office_hours.parse_time_range(time_token)
     if time_range is None:
         reply(event, "Couldn't understand that time range. Use e.g. `4pm-5pm`, `4:00pm-5:30pm`, or 24h "
-                     "`16:00-17:30`. (Bare hours like `4-5` are ambiguous — include am/pm.)")
+                     "`16:00-17:30`. (Bare hours like `4-5` are ambiguous - include am/pm.)")
         return
     start_hhmm, end_hhmm = time_range
     check_in_dt = datetime.combine(session_date, datetime.strptime(start_hhmm, "%H:%M").time())
@@ -1405,12 +1435,12 @@ def handle_add_session(event, slack_id, text, members):
 
     reply(event, f"✅ Added a {hours}h session for {target['member_name']} on "
                  f"{session_date.strftime('%b %d, %Y')} "
-                 f"({office_hours.format_time_12h(start_hhmm)}–{office_hours.format_time_12h(end_hhmm)}), "
-                 f"#{new_row['session_id']}. Pending approval — `approve {target['member_name']}` to approve it.{note}")
+                 f"({office_hours.format_time_12h(start_hhmm)}-{office_hours.format_time_12h(end_hhmm)}), "
+                 f"#{new_row['session_id']}. Pending approval - `approve {target['member_name']}` to approve it.{note}")
     try:
         post(target["slack_id"],
              f"{who} added a {hours}h session for you on {session_date.strftime('%b %d, %Y')} "
-             f"({office_hours.format_time_12h(start_hhmm)}–{office_hours.format_time_12h(end_hhmm)}), pending approval.")
+             f"({office_hours.format_time_12h(start_hhmm)}-{office_hours.format_time_12h(end_hhmm)}), pending approval.")
     except SlackApiError as e:
         logger.warning(f"Could not DM {target['member_name']} about retroactive session: {e}")
 
@@ -1472,12 +1502,12 @@ def handle_set_member_field(event, slack_id, text, members):
         target["seniority"] = str(new_seniority)
         write_members(members)
         logger.info(f"{who} set seniority for {target['member_name']}: {old_level} -> {new_seniority}")
-        reply(event, f"Updated seniority for {target['member_name']}: {old_level} → {new_seniority}")
+        reply(event, f"Updated seniority for {target['member_name']}: {old_level} -> {new_seniority}")
 
         if new_seniority < old_level:
             try:
                 post(target["slack_id"], _format_capabilities_message(
-                    new_seniority, header=f"🎉 Congratulations — you've been granted seniority {new_seniority}!"
+                    new_seniority, header=f"Congratulations - you've been granted seniority {new_seniority}!"
                 ))
             except SlackApiError as e:
                 logger.warning(f"Could not DM promotion notice to {target['member_name']}: {e}")
@@ -1503,7 +1533,7 @@ def handle_set_member_field(event, slack_id, text, members):
 
         # FIXED: was a split-and-lowercase-compare loop that failed for @mentions on
         # both the target and lead sides. Now uses extract_mention_and_rest() for the
-        # target first, then for the lead from the remainder — handles all combinations
+        # target first, then for the lead from the remainder - handles all combinations
         # of @mention and plain name for both arguments.
         target, remainder = extract_mention_and_rest(rest, members)
         if not target:
@@ -1528,7 +1558,7 @@ def handle_set_member_field(event, slack_id, text, members):
         target["lead_slack_id"] = lead["slack_id"]
         write_members(members)
         logger.info(f"{who} set lead for {target['member_name']} -> {lead['member_name']}")
-        reply(event, f"Set lead for {target['member_name']} → {lead['member_name']}.")
+        reply(event, f"Set lead for {target['member_name']} -> {lead['member_name']}.")
         return
 
     reply(event, "Unknown subcommand. Use `set seniority` or `set lead`.")
@@ -1618,11 +1648,11 @@ def handle_register(event, slack_id, text, members):
 
     logger.info(f"Admin registered new member: {display_name} ({new_slack_id}), card_uid={card_uid}")
     reply(event, (
-        f" Registered *{display_name}* (<@{new_slack_id}>)\n"
-        f"• Seniority: 5 (lowest by default)\n"
-        # f"• Card UID: `{card_uid}` (placeholder, update if they have a physical card)\n"
-        f"• Lead: not set\n\n"
-        f"To update: `set seniority @mention <1-5>` · `set lead @mention @lead`"
+        f"✅ Registered *{display_name}* (<@{new_slack_id}>)\n"
+        f"- Seniority: 5 (lowest by default)\n"
+        # f"- Card UID: `{card_uid}` (placeholder, update if they have a physical card)\n"
+        f"- Lead: not set\n\n"
+        f"To update: `set seniority @mention <1-5>` / `set lead @mention @lead`"
     ))
     # Notify the new member
     try:
@@ -1681,8 +1711,8 @@ def handle_admin_shutdown_request(event, slack_id, members):
     n = len(CURRENT_MEMBERS)
     _set_pending_confirm(slack_id, "shutdown")
     reply(event, (
-        f"⚠️ This will check out all {n} currently active member(s) and shut the bot down completely. "
-        f"It will need to be started manually afterward — it will *not* restart on its own.\n\n"
+        f"This will check out all {n} currently active member(s) and shut the bot down completely. "
+        f"It will need to be started manually afterward - it will *not* restart on its own.\n\n"
         f"Type `confirm shutdown` within {ADMIN_CONFIRM_TIMEOUT_MINUTES} minutes to proceed, or `cancel` to abort."
     ))
 
@@ -1696,8 +1726,8 @@ def handle_confirm_shutdown(event, slack_id, members):
     member = members.get(slack_id)
     who = member["member_name"] if member else slack_id
     logger.warning(f"Admin shutdown confirmed by {who} ({slack_id}).")
-    reply(event, "Shutting down now — checking everyone out and saving state.")
-    notify_all_admins(f"🛑 Bot is being shut down by {who}.", exclude_slack_id=slack_id)
+    reply(event, "Shutting down now - checking everyone out and saving state.")
+    notify_all_admins(f"Bot is being shut down by {who}.", exclude_slack_id=slack_id)
     # Reuse the exact same tested graceful-shutdown path used for SIGTERM/SIGINT,
     # rather than duplicating the checkout/save logic here.
     os.kill(os.getpid(), signal.SIGTERM)
@@ -1752,8 +1782,8 @@ def _parse_flexible_date(token, allow_future=False):
 
 def handle_admin_semester_restart_request(event, slack_id, text, members):
     """
-    `admin semester restart [name]` — starts today.
-    `admin semester restart from <date> [name]` — starts from a given date,
+    `admin semester restart [name]` - starts today.
+    `admin semester restart from <date> [name]` - starts from a given date,
     past or future (`today`, `yesterday`, `YYYY-MM-DD`, `M/D[/YYYY]`).
     """
     if not is_admin_level(slack_id, members):
@@ -1768,7 +1798,7 @@ def handle_admin_semester_restart_request(event, slack_id, text, members):
     if rest.lower().startswith("from "):
         from_tokens = rest[len("from "):].strip().split(None, 1)
         if not from_tokens:
-            reply(event, "Usage: `admin semester restart from <date> [name]` — "
+            reply(event, "Usage: `admin semester restart from <date> [name]` - "
                          "date can be `today`, `yesterday`, `YYYY-MM-DD`, `M/D`, past or future.")
             return
         parsed = _parse_flexible_date(from_tokens[0], allow_future=True)
@@ -1786,8 +1816,8 @@ def handle_admin_semester_restart_request(event, slack_id, text, members):
     _set_pending_confirm(slack_id, "semester_restart", {"label": label, "start_date": start_date.isoformat()})
     when = "today" if start_date == datetime.now().date() else start_date.strftime("%b %d, %Y")
     reply(event, (
-        f"⚠️ This will start a new reporting period: *{label}*, beginning {when}.\n"
-        f"Past attendance history is kept forever — `my hours` / `hours report` will only show "
+        f"This will start a new reporting period: *{label}*, beginning {when}.\n"
+        f"Past attendance history is kept forever - `my hours` / `hours report` will only show "
         f"sessions from {when} onward until the next restart.\n\n"
         f"Type `confirm semester restart` within {ADMIN_CONFIRM_TIMEOUT_MINUTES} minutes to proceed, "
         f"or `cancel` to abort.\n"
@@ -1812,7 +1842,7 @@ def handle_confirm_semester_restart(event, slack_id, members):
     who = member["member_name"] if member else slack_id
     set_semester_state(label, who, start_date=start_date)
     logger.warning(f"Semester restarted by {who} ({slack_id}): {label}, starting {start_date}")
-    reply(event, f"New semester started: *{label}*, beginning {start_date.strftime('%b %d, %Y')}.")
+    reply(event, f"✅ New semester started: *{label}*, beginning {start_date.strftime('%b %d, %Y')}.")
     post(ANNOUNCE_CHANNEL_ID, f"New semester started: *{label}*. Hours tracking has reset for the new term.")
 
 
@@ -1836,7 +1866,7 @@ def handle_admin_add(event, slack_id, text, members):
     added_by = approver["member_name"] if approver else slack_id
     add_admin_record(target["slack_id"], target["member_name"], added_by)
     logger.warning(f"{added_by} added {target['member_name']} ({target['slack_id']}) as an admin.")
-    reply(event, f" {target['member_name']} is now an admin.")
+    reply(event, f"✅ {target['member_name']} is now an admin.")
     try:
         post(target["slack_id"], f"You've been made an admin of the shop bot by {added_by}. "
                                    f"Send `help` to see the full command list, including admin commands.")
@@ -1867,7 +1897,7 @@ def handle_admin_remove(event, slack_id, text, members):
 
 
 def handle_admin_remove_member(event, slack_id, text, members):
-    """`admin remove member <name or @mention>` — deactivates a member (admin-level only)."""
+    """`admin remove member <name or @mention>` - deactivates a member (admin-level only)."""
     if not is_admin_level(slack_id, members):
         reply(event, "You're not authorized to remove members.")
         return
@@ -1907,7 +1937,7 @@ def handle_admin_remove_member(event, slack_id, text, members):
 
 
 def handle_admin_restore_member(event, slack_id, text, members):
-    """`admin restore member <name or @mention>` — reactivates a previously removed member."""
+    """`admin restore member <name or @mention>` - reactivates a previously removed member."""
     if not is_admin_level(slack_id, members):
         reply(event, "You're not authorized to restore members.")
         return
@@ -1930,7 +1960,7 @@ def handle_admin_restore_member(event, slack_id, text, members):
 
 
 def handle_admin_log(event, slack_id, text, members):
-    """`admin log [n]` — tail the last n lines of bot.log (default 30, max 200)."""
+    """`admin log [n]` - tail the last n lines of bot.log (default 30, max 200)."""
     if not is_admin_level(slack_id, members):
         reply(event, "You're not authorized to view logs.")
         return
@@ -1966,12 +1996,12 @@ def handle_admin_log(event, slack_id, text, members):
 
 def handle_about(event):
     reply(event, (
-        " *Shop Attendance Bot*\n\n"
+        "*Shop Attendance Bot*\n\n"
         "I track check-ins and check-outs for the shop, keep hours per semester, "
         "handle approvals, and cover a few admin and office-hours-scheduling tasks "
         "behind the scenes.\n\n"
         "Send `help` any time to see everything I can do.\n\n"
-        "Built and maintained by Kushagra Taneja (Kush). Found a bug or have a suggestion? "
+        "Built and maintained by Kushagra Taneja. Found a bug or have a suggestion? "
         "DM him directly on Slack, or use `feedback <message>` to send it anonymously."
     ))
 
@@ -1981,7 +2011,7 @@ def _office_hours_today_lines():
     blocks = office_hours.list_for_day(OFFICE_HOURS_FILE, today_idx)
     return [
         f"- {b['member_name']}: {office_hours.format_time_12h(b['start_time'])}"
-        f"–{office_hours.format_time_12h(b['end_time'])}"
+        f"-{office_hours.format_time_12h(b['end_time'])}"
         for b in blocks
     ]
 
@@ -2110,7 +2140,7 @@ def format_hours_report(sessions, include_disapproved=False):
         approved = str(row.get("approved", "")).strip().lower()
 
         if approved in ("false", ""):
-            status = "⏳ Pending"
+            status = "Pending"
             try:
                 total_pending += float(row.get("hours", 0))
             except (ValueError, TypeError):
@@ -2144,7 +2174,7 @@ def format_hours_report(sessions, include_disapproved=False):
             hrs = "?h"
 
         i += 1
-        lines.append(f"{i}. {ci} – {co}  |  {hrs}  |  {status}")
+        lines.append(f"{i}. {ci} - {co}  |  {hrs}  |  {status}")
 
     return "\n".join(lines), round(total_approved, 2), round(total_pending, 2)
 
@@ -2182,7 +2212,7 @@ def handle_my_info(event, member, members):
         lead     = members.get(lead_id)
         lead_str = lead["member_name"] if lead else f"Unknown ({lead_id})"
     else:
-        lead_str = "Not set — use `set my lead @mention` to assign one"
+        lead_str = "Not set - use `set my lead @mention` to assign one"
 
     sem_name, start, end = get_current_semester()
     if sem_name:
@@ -2250,15 +2280,15 @@ def handle_feedback(event, slack_id, text, members):
     if not msg:
         reply(event, "Usage: `feedback <your message>`")
         return
-    notify_all_admins(f" *Anonymous feedback:*\n{msg}")
+    notify_all_admins(f"*Anonymous feedback:*\n{msg}")
     reply(event, "Your feedback has been sent anonymously. Thank you.")
     logger.info("Anonymous feedback received (sender identity withheld)")
 
 
 def handle_my_hours(event, member, weekly=False):
     """
-    `my hours`        — current semester summary
-    `my hours weekly` — this Mon–Sun week only
+    `my hours`        - current semester summary
+    `my hours weekly` - this Mon-Sun week only
 
     FIXED: added `weekly` parameter (was missing, causing TypeError when dispatcher
     called handle_my_hours(event, member, weekly=True)).
@@ -2267,14 +2297,14 @@ def handle_my_hours(event, member, weekly=False):
 
     if weekly:
         start, end = get_current_week_bounds()
-        label      = f"week of {start} – {end}"
+        label      = f"week of {start} - {end}"
         sessions   = get_semester_sessions(member["slack_id"], name, start, end, include_disapproved=False)
         if not sessions:
-            reply(event, f"No sessions recorded for you this week ({start} – {end}).")
+            reply(event, f"No sessions recorded for you this week ({start} - {end}).")
             return
         body, approved_hrs, pending_hrs = format_hours_report(sessions, include_disapproved=False)
         reply(event, (
-            f"Your hours — {label}:\n\n"
+            f"Your hours - {label}:\n\n"
             f"{body}\n\n"
             f"Approved: {approved_hrs}h  |  Pending approval: {pending_hrs}h"
         ))
@@ -2287,15 +2317,69 @@ def handle_my_hours(event, member, weekly=False):
 
     sessions = get_semester_sessions(member["slack_id"], name, start, end, include_disapproved=False)
     if not sessions:
-        reply(event, f"No sessions recorded for you this {sem_name} semester ({start} – {end}).")
+        reply(event, f"No sessions recorded for you this {sem_name} semester ({start} - {end}).")
         return
 
     body, approved_hrs, pending_hrs = format_hours_report(sessions, include_disapproved=False)
     reply(event, (
-        f"Your hours — {sem_name} ({start} – {end}):\n\n"
+        f"Your hours - {sem_name} ({start} - {end}):\n\n"
         f"{body}\n\n"
         f"Approved: {approved_hrs}h  |  Pending approval: {pending_hrs}h"
     ))
+
+
+def handle_top_hours(event, member, members):
+    """`top hours` -- top 5 approved-hours totals for the current semester,
+    plus the caller's own rank even if they're outside the top 5."""
+    sem_name, start, end = get_current_semester()
+    if sem_name is None:
+        reply(event, "Could not determine the current semester. Contact an admin.")
+        return
+
+    totals = {}   # slack_id -> [display_name, hours]
+    for row in read_attendance_rows():
+        if str(row.get("approved", "")).strip().lower() != "true":
+            continue
+        try:
+            ci_dt = row_to_dt(row, "check_in")
+            ci_date = ci_dt.date() if ci_dt else None
+        except (ValueError, TypeError):
+            ci_date = None
+        if ci_date is None or not (start <= ci_date <= end):
+            continue
+        sid = _resolve_row_slack_id(row, members)
+        if not sid:
+            continue
+        try:
+            hrs = float(row.get("hours", 0))
+        except (ValueError, TypeError):
+            hrs = 0.0
+        display_name = members.get(sid, {}).get("member_name", row.get("member_name", "?"))
+        if sid not in totals:
+            totals[sid] = [display_name, 0.0]
+        totals[sid][1] += hrs
+
+    if not totals:
+        reply(event, f"No approved hours recorded yet this {sem_name}.")
+        return
+
+    ranking = sorted(totals.items(), key=lambda kv: kv[1][1], reverse=True)
+
+    lines = [f"Top hours - {sem_name}:"]
+    for i, (sid, (name, hrs)) in enumerate(ranking[:5], start=1):
+        lines.append(f"{i}. {name} - {round(hrs, 2)}h")
+
+    caller_sid = member["slack_id"]
+    caller_rank = next((i for i, (sid, _) in enumerate(ranking, start=1) if sid == caller_sid), None)
+    if caller_rank is None:
+        lines.append(f"\nYou: no approved hours yet this {sem_name}.")
+    elif caller_rank <= 5:
+        lines.append(f"\nYou're #{caller_rank} of {len(ranking)}.")
+    else:
+        caller_hrs = totals[caller_sid][1]
+        lines.append(f"\nYou're #{caller_rank} of {len(ranking)} with {round(caller_hrs, 2)}h.")
+
+    reply(event, "\n".join(lines))
 
 
 def handle_hours_report(event, slack_id, text, members):
@@ -2314,7 +2398,7 @@ def handle_hours_report(event, slack_id, text, members):
         return
 
     # FIXED: was text_lc.removeprefix("hours report ").strip() followed by a plain
-    # name-only next() lookup — both failed for @mentions.
+    # name-only next() lookup - both failed for @mentions.
     target, _ = extract_mention_and_rest(raw, members)
     if not target:
         reply(event, f"Member not found: {raw!r}. Use a @mention or their full name.")
@@ -2333,12 +2417,12 @@ def handle_hours_report(event, slack_id, text, members):
 
     sessions = get_semester_sessions(target["slack_id"], display_name, start, end, include_disapproved=True)
     if not sessions:
-        reply(event, f"No sessions found for {display_name} this {sem_name} semester ({start} – {end}).")
+        reply(event, f"No sessions found for {display_name} this {sem_name} semester ({start} - {end}).")
         return
 
     body, approved_hrs, pending_hrs = format_hours_report(sessions, include_disapproved=True)
     reply(event, (
-        f"Hours report for {display_name} — {sem_name} ({start} – {end}):\n\n"
+        f"Hours report for {display_name} - {sem_name} ({start} - {end}):\n\n"
         f"{body}\n\n"
         f"Approved: {approved_hrs}h  |  Pending: {pending_hrs}h"
     ))
@@ -2356,25 +2440,26 @@ def _help_text():
         "\n"
         "*Shop status*\n"
         "- `who is in` / `is shop open`\n"
-        "- `office hours today` — who's scheduled today\n"
+        "- `office hours today` - who's scheduled today\n"
         "\n"
         "*Hours*\n"
-        "- `my hours` — semester summary\n"
-        "- `my hours weekly` — this week\n"
-        "- `my info` — your profile, lead, and session counts\n"
+        "- `my hours` - semester summary\n"
+        "- `my hours weekly` - this week\n"
+        "- `my info` - your profile, lead, and session counts\n"
+        "- `top hours` - top 5 for the semester, and your own rank\n"
         "\n"
         "*Approvals* (seniors/leads/admins)\n"
-        "- `approve @mention` — approve all pending sessions\n"
-        "- `disapprove @mention` — list pending sessions with IDs\n"
-        "- `disapprove @mention <session_id>` — disapprove a specific session\n"
-        "- `hours report @mention` — full semester report\n"
+        "- `approve @mention` - approve all pending sessions\n"
+        "- `disapprove @mention` - list pending sessions with IDs\n"
+        "- `disapprove @mention <session_id>` - disapprove a specific session\n"
+        "- `hours report @mention` - full semester report\n"
         "\n"
         "*Seniority-2+ / Admin*\n"
-        "- `add session @mention <date> <start>-<end>` — log a forgotten session, "
+        "- `add session @mention <date> <start>-<end>` - log a forgotten session, "
         "e.g. `add session @jake yesterday 4pm-5pm`\n"
         "\n"
         f"*Office hours* (seniority {OFFICE_HOURS_MAX_SENIORITY_LEVEL}+ or admin to schedule; anyone can view)\n"
-        "- `office hours set <day> <start>-<end>` — e.g. `office hours set Tue 3pm-5pm`\n"
+        "- `office hours set <day> <start>-<end>` - e.g. `office hours set Tue 3pm-5pm`\n"
         "- `office hours cancel <id>` / `office hours cancel all`\n"
         "- `office hours list` / `office hours list @mention`\n"
         "\n"
@@ -2386,17 +2471,17 @@ def _help_text():
         "- `set seniority @mention <1-5>`\n"
         "- `set lead @mention @lead` / `set lead @mention none`\n"
         "- `announcement formal` / `announcement casual`\n"
-        "- `register @mention [Full Name]` — add a new member\n"
+        "- `register @mention [Full Name]` - add a new member\n"
         "- `admin remove member @mention` / `admin restore member @mention`\n"
         "- `admin add admin @mention` / `admin remove admin @mention`\n"
         "- `admin semester restart [name]` / `admin semester restart from <date> [name]`\n"
-        "- `admin log [n]` — view recent log lines (default 30, max 200)\n"
-        "- `admin shutdown` — gracefully shut the bot down\n"
+        "- `admin log [n]` - view recent log lines (default 30, max 200)\n"
+        "- `admin shutdown` - gracefully shut the bot down\n"
         "\n"
         "*Other*\n"
-        "- `feedback <message>` — send anonymous feedback to the admins\n"
-        "- `about` — what this bot is\n"
-        "- `help` — this list"
+        "- `feedback <message>` - send anonymous feedback to the admins\n"
+        "- `about` - what this bot is\n"
+        "- `help` - this list"
     )
 
 
@@ -2424,7 +2509,7 @@ def process_message(client, req):
         except Exception:
             logger.error("Failed to notify user of error.", exc_info=True)
         try:
-            _notify_admins_of_error(f"⚠️ Bot error while handling a message: `{e}`\nCheck bot.log for details.")
+            _notify_admins_of_error(f"Bot error while handling a message: `{e}`\nCheck bot.log for details.")
         except Exception:
             logger.error("Failed to notify admins of error.", exc_info=True)
 
@@ -2468,7 +2553,7 @@ def _dispatch_message(event):
 
     logger.info(f"Command from {member['member_name']} ({slack_id}): {text!r}")
 
-    # Watchdog confirmation — member or senior replying "y".
+    # Watchdog confirmation - member or senior replying "y".
     #
     # FIXED: the member's own "y" now resolves their pending alert regardless
     # of its stage (awaiting_member OR awaiting_senior) -- confirm_session()
@@ -2481,10 +2566,10 @@ def _dispatch_message(event):
         if slack_id in SESSION_ALERTS:
             ok = confirm_session(slack_id, slack_id, members)
             if ok:
-                reply(event, "Got it, you're all set until the 8-hour mark, at which point "
+                reply(event, "Got it - you're all set until the 8-hour mark, at which point "
                              "you'll be automatically checked out.")
             else:
-                reply(event, "That confirmation has expired (you're past the 8-hour mark) — "
+                reply(event, "That confirmation has expired (you're past the 8-hour mark) - "
                              "please `check out`, or contact an admin if you're still working.")
             return
         if slack_id in SENIOR_PENDING:
@@ -2493,7 +2578,7 @@ def _dispatch_message(event):
             target_member = members.get(target_slack_id)
             target_name = target_member["member_name"] if target_member else target_slack_id
             if ok:
-                reply(event, f"Confirmed — {target_name}'s session has been extended.")
+                reply(event, f"Confirmed - {target_name}'s session has been extended.")
                 if target_member:
                     post(target_member["slack_id"],
                          f"Your session was confirmed by a senior member. "
@@ -2563,6 +2648,8 @@ def _dispatch_message(event):
         handle_my_hours(event, member, weekly=True)
     elif text_lc == "my hours":
         handle_my_hours(event, member)
+    elif text_lc in ("top hours", "leaderboard"):
+        handle_top_hours(event, member, members)
     elif text_lc.startswith("hours report "):
         # Pass original `text` so @mentions are preserved for parse_mention()
         handle_hours_report(event, slack_id, text, members)
@@ -2602,7 +2689,7 @@ def force_checkout_all(reason="shutdown"):
             except Exception as e:
                 logger.warning(f"Could not notify {name} on {reason}: {e}")
     try:
-        post(ANNOUNCE_CHANNEL_ID, f"Shop closed — all members checked out due to {reason}.")
+        post(ANNOUNCE_CHANNEL_ID, f"Shop closed - all members checked out due to {reason}.")
     except Exception as e:
         logger.warning(f"Could not post shutdown announcement: {e}")
 
@@ -2623,7 +2710,7 @@ logger.info("Syncing members list...")
 try:
     update_members_csv()
 except Exception as e:
-    logger.error(f"Member sync failed: {e} — continuing with existing members.csv")
+    logger.error(f"Member sync failed: {e} - continuing with existing members.csv")
 
 ensure_attendance_file()
 ensure_admins_file()
