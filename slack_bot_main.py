@@ -139,7 +139,7 @@ SHOP_OPEN_MESSAGES = [
 ]
 
 CURRENT_MEMBERS = set()   # set of slack_ids (NOT names -- two members can share a name)
-USE_FORMAL_MODE  = False
+USE_FORMAL_MODE  = True
 
 SESSION_ALERTS = {}   # slack_id -> {"stage", "alert_sent_at", "check_in_dt", "senior_slack_id"}
 SENIOR_PENDING = {}   # senior's slack_id -> target member's slack_id
@@ -2373,11 +2373,16 @@ def handle_top_hours(event, member, members):
     caller_rank = next((i for i, (sid, _) in enumerate(ranking, start=1) if sid == caller_sid), None)
     if caller_rank is None:
         lines.append(f"\nYou: no approved hours yet this {sem_name}.")
+        lines.append(f"\nThis command is just for fun!\n This leaderboard tracks hours logged, not how much someone contributes or how valuable they are to the workshop.\n Everyone contributes in different ways, so hours ≠ value!")
     elif caller_rank <= 5:
         lines.append(f"\nYou're #{caller_rank} of {len(ranking)}.")
+        lines.append(f"\nThis command is just for fun!\n This leaderboard tracks hours logged, not how much someone contributes or how valuable they are to the workshop.\n Everyone contributes in different ways, so hours ≠ value!")
+
     else:
         caller_hrs = totals[caller_sid][1]
         lines.append(f"\nYou're #{caller_rank} of {len(ranking)} with {round(caller_hrs, 2)}h.")
+        lines.append(f"\nReminder: This command is just for fun!\n This leaderboard tracks hours logged, not how much someone contributes or how valuable they are to the workshop.\n Everyone contributes in different ways, so hours ≠ value!")
+
 
     reply(event, "\n".join(lines))
 
